@@ -1684,7 +1684,7 @@ class Grid:
         dim = self._get_dims_from_axis(da, axis)
         return weighted.mean(dim, **kwargs)
 
-    def transform(self, da, axis, target, **kwargs):
+    def transform(self, da, axis, target, max_memory=None, **kwargs):
         """Convert an array of data to new 1D-coordinates along `axis`.
         The method takes a multidimensional array of data `da` and
         transforms it onto another data_array `target_data` in the
@@ -1759,6 +1759,16 @@ class Grid:
         suffix : str, optional
             Customizable suffix to the name of the output array. This will
             be added to the original name of `da`. Defaults to `_transformed`.
+        max_memory : int or str, optional
+            Upper bound on the estimated peak memory, in bytes (or a string
+            such as ``"500MB"``), used to plan chunking. The complete column
+            along `axis` is always kept in a single chunk. For dask-backed
+            inputs the horizontal / time dimensions are split so that a single
+            block -- all inputs, the target, the output and kernel temporaries
+            -- fits within `max_memory`. If a single column already exceeds
+            the budget a `ValueError` is raised before any work is done.
+            Defaults to None, preserving the existing chunking (aside from
+            merging `axis` into a single chunk).
 
         Returns
         -------
@@ -1773,7 +1783,9 @@ class Grid:
             raise ImportError(
                 "The transform functionality of xgcm requires numba. Install using `conda install numba`."
             )
-        return transform(self, axis, da, target, **kwargs)
+        return transform(
+            self, axis, da, target, max_memory=max_memory, **kwargs
+        )
 
 
 def _select_grid_ufunc(funcname, signature: _GridUFuncSignature, module, **kwargs):

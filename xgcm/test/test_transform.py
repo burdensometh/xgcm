@@ -1369,23 +1369,231 @@ def test_grid_transform_multidim_other_dims_error(request, multidim_cases):
 
 
 @pytest.mark.skipif(numba is None, reason="numba required")
-def test_chunking_dim_error():
-    """Assure that error is raised when we chunk along the 'vertical' dimension"""
-
+def test_chunking_along_transform_dim_is_rechunked():
+    """A complete vertical column is retained even if the input is chunked along it."""
     (
         source,
         grid_kwargs,
         target,
         transform_kwargs,
-        _,
+        expected,
         _,
     ) = construct_test_source_data(cases["linear_depth_dens"])
 
-    source = source.chunk({"depth": 1})
+    depth = grid_kwargs["coords"]["Z"]["center"]
+    source = source.chunk({depth: 1})
     axis = list(grid_kwargs["coords"].keys())[0]
     grid = Grid(source, **grid_kwargs)
-    with pytest.raises(ValueError):
-        _ = grid.transform(source.data, axis, target, **transform_kwargs)
+
+    transformed = grid.transform(source.data, axis, target, **transform_kwargs)
+    # The transform axis is merged into one chunk, other dims are untouched.
+    assert transformed.chunks[transformed.get_axis_num("something")] == (
+        transformed.sizes["something"],
+    )
+    xr.testing.assert_allclose(transformed, expected.data)
+
+    # Explicitly passing a budget must not change the numerical result.
+    with_budget = grid.transform(
+        source.data, axis, target, max_memory="10MB", **transform_kwargs
+    )
+    xr.testing.assert_allclose(transformed, with_budget)
+
+
+def _build_budget_case(nz=12, ny=5, nx=4, chunk=None, with_outer=False):
+    """Deterministic multi-column source/grid for budget-planning tests."""
+    rng = np.random.default_rng(0)
+    data = rng.random((nz, ny, nx))
+    z = np.arange(nz) * 10.0 + 5
+    ds = xr.Dataset(
+        {"data": xr.DataArray(data, dims=["z", "y", "x"], coords={"z": z}, name="data")}
+    )
+    coords = {"Z": {"center": "z"}}
+    if with_outer:
+        ds = ds.assign_coords(
+            {"zo": xr.DataArray(np.arange(nz + 1) * 10.0, dims=["zo"])}
+        )
+        coords["Z"]["outer"] = "zo"
+    if chunk is not None:
+        ds = ds.chunk(chunk)
+    return ds, Grid(ds, coords=coords, autoparse_metadata=False)
+
+
+def _transform_targets():
+    linear = xr.DataArray(
+        np.arange(0, 130, 10.0),
+        dims=["zt"],
+        coords={"zt": np.arange(0, 130, 10.0)},
+        name="zt",
+    )
+    conservative = xr.DataArray(
+        np.arange(0, 140, 10.0),
+        dims=["zt"],
+        coords={"zt": np.arange(0, 140, 10.0)},
+        name="zt",
+    )
+    return {"linear": linear, "conservative": conservative}
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+@pytest.mark.parametrize("method", ["linear", "conservative"])
+@pytest.mark.parametrize(
+    "chunk",
+    [
+        {"z": 3, "y": 2, "x": 4},  # chunked along the transform axis
+        {"z": -1, "y": 1, "x": 4},  # single vertical chunk
+    ],
+)
+def test_transform_budget_matches_unbudgeted(method, chunk):
+    """Budget-constrained planning must not alter the result and stay lazy."""
+    with_outer = method == "conservative"
+    target = _transform_targets()[method]
+
+    reference_ds, reference_grid = _build_budget_case(with_outer=with_outer)
+    reference = reference_grid.transform(
+        reference_ds.data,
+        "Z",
+        target,
+        target_data=reference_ds.data,
+        method=method,
+    ).load()
+
+    ds, grid = _build_budget_case(chunk=chunk, with_outer=with_outer)
+    transformed = grid.transform(
+        ds.data,
+        "Z",
+        target,
+        target_data=ds.data,
+        method=method,
+        max_memory="4kB",
+    )
+
+    # The result is still lazy (no hidden compute).
+    assert transformed.chunks is not None
+    # The complete vertical column is retained.
+    assert transformed.sizes["zt"] in (12, 13)
+    # All broadcast dims are split no larger than the full dimension, and at
+    # least one is actually split when the budget is tight.
+    assert all(
+        max(transformed.chunks[transformed.get_axis_num(dim)]) <= transformed.sizes[dim]
+        for dim in ("y", "x")
+    )
+
+    xr.testing.assert_allclose(transformed.load(), reference)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+@pytest.mark.parametrize("method", ["linear", "conservative"])
+def test_transform_budget_rejects_oversized_single_column(method):
+    """A single column exceeding the budget is rejected before any work."""
+    target = _transform_targets()[method]
+    ds, grid = _build_budget_case(
+        chunk={"z": 3, "y": 2, "x": 4}, with_outer=(method == "conservative")
+    )
+
+    with pytest.raises(ValueError, match="single transform column"):
+        grid.transform(
+            ds.data,
+            "Z",
+            target,
+            target_data=ds.data,
+            method=method,
+            max_memory=64,
+        )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_transform_budget_counts_all_inputs():
+    """The estimate must account for da, target_data and target simultaneously."""
+    from xgcm.transform import _estimate_column_bytes, _plan_transform_chunks
+
+    nz = 100
+    n_target = 50
+    # Two float64 columns of nz plus one of n_target.
+    expected = 2 * nz * 8 + n_target * 8
+    assert (
+        _estimate_column_bytes(
+            [(nz, np.float64), (nz, np.float64), (n_target, np.float64)],
+            output_length=n_target,
+            output_dtype=np.float64,
+        )
+        > expected
+    )
+
+    arrays = [
+        xr.DataArray(np.ones((nz, 4, 4)), dims=["z", "y", "x"]).chunk(
+            {"z": 10, "y": 2, "x": 2}
+        )
+    ]
+    plan = _plan_transform_chunks(
+        arrays,
+        core_dims=["z"],
+        input_columns=[(nz, np.float64)],
+        output_length=n_target,
+        output_dtype=np.float64,
+        max_memory=10_000,
+    )
+    # A budget too small for several columns forces horizontal splitting...
+    assert plan.chunks
+    assert plan.columns_per_block is not None and plan.columns_per_block >= 1
+    # ...but the column-heavy estimate is reported and no column is split.
+    assert plan.per_column_bytes > 0
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_transform_budget_bad_input():
+    ds, grid = _build_budget_case()
+    target = _transform_targets()["linear"]
+    with pytest.raises(ValueError, match="must be positive"):
+        grid.transform(ds.data, "Z", target, max_memory=0)
+    with pytest.raises(TypeError):
+        grid.transform(ds.data, "Z", target, max_memory=1.5j)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_transform_no_chunking_without_budget():
+    """Without a budget, numpy-backed inputs stay numpy (no hidden dask)."""
+    ds, grid = _build_budget_case()
+    target = _transform_targets()["linear"]
+    transformed = grid.transform(ds.data, "Z", target)
+    assert transformed.chunks is None
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_transform_budget_does_not_shrink_small_chunks():
+    """A generous budget must leave already-small chunks untouched."""
+    ds, grid = _build_budget_case(chunk={"z": 3, "y": 2, "x": 4})
+    target = _transform_targets()["linear"]
+    transformed = grid.transform(
+        ds.data, "Z", target, target_data=ds.data, max_memory="1GB"
+    )
+    # y and x chunks are already within the planned block, so they are kept.
+    assert transformed.chunks[transformed.get_axis_num("y")] == ds.data.chunks[
+        ds.data.get_axis_num("y")
+    ]
+    assert transformed.chunks[transformed.get_axis_num("x")] == ds.data.chunks[
+        ds.data.get_axis_num("x")
+    ]
+    # The vertical column has been merged into one chunk.
+    assert transformed.chunks[transformed.get_axis_num("zt")] == (13,)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_transform_budget_mixed_numpy_dask():
+    """A numpy ``target_data`` with a dask ``da`` must still produce the result."""
+    ds, grid = _build_budget_case(chunk={"z": 3, "y": 2, "x": 4})
+    target = _transform_targets()["linear"]
+
+    reference_ds, reference_grid = _build_budget_case()
+    reference = reference_grid.transform(
+        reference_ds.data, "Z", target, target_data=reference_ds.data
+    ).load()
+
+    # target_data stays numpy-backed: it is already resident memory.
+    transformed = grid.transform(
+        ds.data, "Z", target, target_data=reference_ds.data, max_memory=3000
+    )
+    assert transformed.chunks is not None
+    xr.testing.assert_allclose(transformed.load(), reference)
 
 
 @pytest.mark.skipif(numba is None, reason="numba required")

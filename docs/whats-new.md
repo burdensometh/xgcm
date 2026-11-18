@@ -5,6 +5,19 @@
 
 ### New Features
 
+- Add a `max_memory` budget to `Grid.transform` (all methods). The complete
+  column along the transform axis is always retained in a single chunk, so
+  inputs chunked along the vertical axis (e.g. CMIP6 ocean fields on the
+  Pangeo cloud store) no longer raise and no longer require a manual
+  `.chunk({<vertical>: -1})`. When a budget is given, horizontal / time
+  dimensions are split so that one block -- all inputs, the target, the output
+  and kernel temporaries, including multiple inputs in flight for a
+  conservative transform -- fits within the budget. A single column that
+  exceeds the budget raises a `ValueError` before any work is scheduled. The
+  transform remains lazy (no hidden compute) and results are numerically
+  identical to the unplanned path. Without `max_memory`, existing chunking is
+  preserved apart from merging the transform axis into one chunk.
+
 ### Breaking Changes
 
 ### Internal Changes

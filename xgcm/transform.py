@@ -3,7 +3,10 @@ Classes and functions for 1D coordinate transformation.
 """
 
 import functools
+import math
+import numbers
 import warnings
+from typing import Dict, NamedTuple, Optional
 
 import numpy as np
 import xarray as xr
@@ -194,6 +197,215 @@ def interp_1d_conservative(phi, theta, target_theta_bins):
 """Mid level functions (xarray)"""
 
 
+class _TransformChunkPlan(NamedTuple):
+    """Chunk sizes chosen for a single transform block.
+
+    The transform dimension (the "core" dimension) is always kept as one
+    complete column. ``chunks`` maps every broadcast (non-core) dimension that
+    had to be split to the maximum number of elements allowed in one block.
+    """
+
+    chunks: Dict[str, int]
+    per_column_bytes: int
+    max_memory: Optional[int]
+
+    @property
+    def columns_per_block(self) -> Optional[int]:
+        if not self.chunks:
+            return None
+        n_columns = 1
+        for size in self.chunks.values():
+            n_columns *= size
+        return n_columns
+
+
+def _parse_max_memory(max_memory):
+    """Normalize a user supplied memory budget to bytes."""
+    if max_memory is None:
+        return None
+    if isinstance(max_memory, bool):
+        raise TypeError("`max_memory` must be a number of bytes or a string.")
+    if isinstance(max_memory, str):
+        try:
+            from dask.utils import parse_bytes  # type: ignore
+        except ImportError:  # pragma: no cover - dask is a hard dependency
+            raise ImportError(
+                "Reading `max_memory` from a string requires dask. "
+                "Pass an integer number of bytes instead."
+            )
+        value = parse_bytes(max_memory)
+    elif isinstance(max_memory, numbers.Real):
+        if not math.isfinite(float(max_memory)):
+            raise ValueError("`max_memory` must be finite.")
+        value = int(max_memory)
+    else:
+        raise TypeError("`max_memory` must be a number of bytes or a string.")
+    if value <= 0:
+        raise ValueError(f"`max_memory` must be positive, received {max_memory!r}.")
+    return value
+
+
+def _column_bytes(length, dtype):
+    return int(length) * np.dtype(dtype).itemsize
+
+
+def _estimate_column_bytes(input_columns, output_length, output_dtype):
+    """Estimate peak bytes needed for one transform column.
+
+    ``input_columns`` is an iterable of ``(length, dtype)`` pairs describing
+    every input that is in flight at the same time for a single column (e.g.
+    both ``da`` and ``target_data``). The estimate adds the output column and
+    a scratch term covering the contiguous copies / accumulation buffers
+    allocated by the (guvectorized) kernels.
+    """
+    input_bytes = sum(
+        _column_bytes(length, dtype) for length, dtype in input_columns
+    )
+    output_bytes = _column_bytes(output_length, output_dtype)
+    scratch_bytes = input_bytes + output_bytes
+    return input_bytes + output_bytes + scratch_bytes
+
+
+def _collect_non_core_dims(arrays, core_dims):
+    non_core_dims = []
+    for array in arrays:
+        for dim in array.dims:
+            if dim in core_dims or dim in non_core_dims:
+                continue
+            non_core_dims.append(dim)
+    return non_core_dims
+
+
+def _initial_block_size(arrays, dim):
+    """Largest existing chunk along ``dim`` (falls back to the full length)."""
+    length = None
+    largest_chunk = 0
+    for array in arrays:
+        if dim not in array.dims:
+            continue
+        length = array.sizes[dim]
+        if array.chunks is not None:
+            largest_chunk = max(
+                largest_chunk, max(array.chunks[array.get_axis_num(dim)])
+            )
+    if length is None:
+        return 1
+    return min(length, largest_chunk or length)
+
+
+def _plan_transform_chunks(
+    arrays, core_dims, input_columns, output_length, output_dtype, max_memory
+):
+    """Plan chunk sizes for a transform.
+
+    The complete transform (vertical) column is always retained. If a memory
+    budget is supplied, broadcast (horizontal/time) dimensions are split so
+    that the estimated peak memory of a single block -- all inputs, the
+    target, the output and kernel temporaries -- fits within ``max_memory``.
+    """
+    per_column_bytes = _estimate_column_bytes(
+        input_columns, output_length, output_dtype
+    )
+    budget = _parse_max_memory(max_memory)
+
+    if budget is not None and per_column_bytes > budget:
+        raise ValueError(
+            "Cannot perform transform within `max_memory`="
+            f"{budget} bytes: a single transform column requires approximately "
+            f"{per_column_bytes} bytes (all inputs, target, output and kernel "
+            "temporaries). Increase `max_memory` or split the data before "
+            "calling transform."
+        )
+
+    dask_backed = any(array.chunks is not None for array in arrays)
+    if budget is None or not dask_backed:
+        return _TransformChunkPlan(
+            chunks={}, per_column_bytes=per_column_bytes, max_memory=budget
+        )
+
+    capacity = max(1, budget // max(per_column_bytes, 1))
+    non_core_dims = _collect_non_core_dims(arrays, core_dims)
+    sizes = {
+        dim: _initial_block_size(arrays, dim) for dim in non_core_dims
+    }
+
+    # Shrink the largest broadcast chunk until one block fits the budget.
+    while math.prod(sizes.values()) > capacity:
+        dim = max(sizes, key=lambda key: (sizes[key], key))
+        if sizes[dim] <= 1:
+            # Every remaining dimension of length > 1 has been split down to
+            # a single element. ``capacity`` is at least one, so the loop can
+            # only end here when the block already fits.
+            break
+        sizes[dim] = max(1, sizes[dim] // 2)
+
+    return _TransformChunkPlan(
+        chunks=sizes, per_column_bytes=per_column_bytes, max_memory=budget
+    )
+
+
+def _apply_chunk_plan(plan, array, core_dims):
+    """Apply a chunk plan to ``array`` without computing it.
+
+    Every core dimension is merged into a single chunk (one complete column).
+    Broadcast dimensions are only rechunked when they exceed the planned block
+    size. Numpy-backed arrays are returned unchanged: their data is already
+    resident in memory, so splitting them cannot lower peak memory and would
+    silently make the result lazy. When a dask input is present, xarray aligns
+    the numpy inputs to the planned chunks as part of the dask graph.
+    """
+    if not array.dims or array.chunks is None:
+        return array
+
+    core_dims = set(core_dims)
+    spec = {}
+    for dim in core_dims:
+        if dim not in array.dims:
+            continue
+        # Only merge when the column is actually split across chunks.
+        if len(array.chunks[array.get_axis_num(dim)]) > 1:
+            spec[dim] = -1
+
+    for dim, size in plan.chunks.items():
+        if dim not in array.dims or dim in core_dims:
+            continue
+        if max(array.chunks[array.get_axis_num(dim)]) > size:
+            spec[dim] = size
+
+    if not spec:
+        return array
+    return array.chunk(spec)
+
+
+def _prepare_transform_inputs(
+    phi, theta, target, phi_dim, theta_dim, target_dim, output_length, max_memory
+):
+    """Plan and apply budget-constrained chunking to transform inputs.
+
+    All inputs that are simultaneously in flight for a single column (``phi``,
+    ``theta`` and ``target``) contribute to the memory estimate. The complete
+    column along the transform core dimensions is always retained as one chunk;
+    broadcast (horizontal / time) dimensions are split only when required to
+    obey ``max_memory``.
+    """
+    plan = _plan_transform_chunks(
+        arrays=[phi, theta, target],
+        core_dims=[phi_dim, theta_dim, target_dim],
+        input_columns=[
+            (phi.sizes[phi_dim], phi.dtype),
+            (theta.sizes[theta_dim], theta.dtype),
+            (target.sizes[target_dim], target.dtype),
+        ],
+        output_length=output_length,
+        output_dtype=phi.dtype,
+        max_memory=max_memory,
+    )
+    phi = _apply_chunk_plan(plan, phi, [phi_dim])
+    theta = _apply_chunk_plan(plan, theta, [theta_dim])
+    target = _apply_chunk_plan(plan, target, [target_dim])
+    return phi, theta, target
+
+
 def input_handling(func):
     """Decorator that handles input naming for interpolations."""
 
@@ -234,6 +446,17 @@ def input_handling(func):
 def linear_interpolation(
     phi, theta, target_theta_levels, phi_dim, theta_dim, target_dim, **kwargs
 ):
+    max_memory = kwargs.pop("max_memory", None)
+    phi, theta, target_theta_levels = _prepare_transform_inputs(
+        phi,
+        theta,
+        target_theta_levels,
+        phi_dim,
+        theta_dim,
+        target_dim,
+        output_length=target_theta_levels.sizes[target_dim],
+        max_memory=max_memory,
+    )
     out = xr.apply_ufunc(
         interp_1d_linear,
         phi,
@@ -253,6 +476,19 @@ def linear_interpolation(
 def conservative_interpolation(
     phi, theta, target_theta_levels, phi_dim, theta_dim, target_dim, **kwargs
 ):
+    max_memory = kwargs.pop("max_memory", None)
+    phi, theta, target_theta_levels = _prepare_transform_inputs(
+        phi,
+        theta,
+        target_theta_levels,
+        phi_dim,
+        theta_dim,
+        target_dim,
+        # The conservative method returns one value per interval between
+        # adjacent target bounds, i.e. one fewer than the number of bounds.
+        output_length=target_theta_levels.sizes[target_dim] - 1,
+        max_memory=max_memory,
+    )
     out = xr.apply_ufunc(
         interp_1d_conservative,
         phi,
@@ -287,6 +523,7 @@ def transform(
     mask_edges=True,
     bypass_checks=False,
     suffix="_transformed",
+    max_memory=None,
 ):
     """Convert an array of data to new 1D-coordinates.
     The method takes a multidimensional array of data `da` and
@@ -361,6 +598,16 @@ def transform(
     suffix : str, optional
         Customizable suffix to the name of the output array. This will
         be added to the original name of `da`. Defaults to `_transformed`.
+    max_memory : int or str, optional
+        Upper bound on the estimated peak memory, in bytes (or a string such
+        as ``"500MB"``), used to plan chunking of the transform. The complete
+        column along `axis` is always kept in a single chunk. When the inputs
+        are dask-backed, the horizontal / time dimensions are split so that a
+        single block -- all inputs, the target, the output and kernel
+        temporaries -- fits within `max_memory`. If a single column already
+        exceeds the budget, a `ValueError` is raised before any work is done.
+        Defaults to None, in which case the existing chunking is preserved
+        (aside from merging `axis` into a single chunk).
 
     Returns
     -------
@@ -372,6 +619,8 @@ def transform(
     - If `target` is multi-dimensional, you must specify `target_dim` explicitly.
     - If `target_dim` is not specified and `target_data` has no name, a default name "TRANSFORMED_DIMENSION" will be used for the transformed dimension.
     - For `conservative` transformations, `target_data` must be located on cell bounds.
+    - `max_memory` only affects the dask chunk layout; no data is computed
+      eagerly and the returned array stays lazy.
 
     """
 
@@ -465,6 +714,7 @@ def transform(
             mask_edges=mask_edges,
             bypass_checks=bypass_checks,
             logarithmic=(method == "log"),
+            max_memory=max_memory,
         )
     elif method == "conservative":
         if isinstance(target, xr.DataArray):
@@ -494,13 +744,38 @@ def transform(
                 "The `target data` input is not located on the cell bounds. This method will continue with linear interpolation with repeated boundary values. For most accurate results provide values on cell bounds.",
                 UserWarning,
             )
+            # The internal `grid.interp` is itself a grid ufunc that requires a
+            # single chunk along its core dimension, and the intermediate
+            # column is in flight together with the transform inputs. Plan the
+            # chunking (and reject an over-budget single column) before
+            # interpolating rather than after.
+            center_dim = axis._get_position_name(target_data)[1]
+            plan = _plan_transform_chunks(
+                arrays=[da, target_data, target],
+                core_dims=[dim, center_dim, target_dim],
+                # Peak memory spans the internal interpolation, when the center
+                # column of `target_data` is in flight alongside `da`, the
+                # interpolated outer column (one element longer), the target
+                # and the output.
+                input_columns=[
+                    (da.sizes[dim], da.dtype),
+                    (target_data.sizes[center_dim], target_data.dtype),
+                    (target_data.sizes[center_dim] + 1, target_data.dtype),
+                    (target.sizes[target_dim], target.dtype),
+                ],
+                output_length=target.sizes[target_dim] - 1,
+                output_dtype=da.dtype,
+                max_memory=max_memory,
+            )
+            da = _apply_chunk_plan(plan, da, [dim])
+            target = _apply_chunk_plan(plan, target, [target_dim])
+            target_data = _apply_chunk_plan(plan, target_data, [center_dim])
+
             target_data = grid.interp(target_data, axis_name, padding="extend")
             # This seems to end up with chunks along the axis dimension.
             # Rechunk to keep xr.apply_func from complaining.
             # TODO: This should be made obsolete, when the internals are refactored using numba
-            target_data = target_data.chunk(
-                {axis._get_position_name(target_data)[1]: -1}
-            )
+            target_data = target_data.chunk({target_data_dim: -1})
 
         out = conservative_interpolation(
             da,
@@ -509,6 +784,7 @@ def transform(
             dim,
             target_data_dim,  # in this case the dimension of phi and theta are the same
             target_dim,
+            max_memory=max_memory,
         )
 
     return out
