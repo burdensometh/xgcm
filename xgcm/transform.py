@@ -142,6 +142,152 @@ def _interp_1d_conservative(phi, theta_1, theta_2, theta_hat_1, theta_hat_2, out
                     output[j] += alpha * phi[i]
 
 
+def _array_module(a):
+    """Return the array module (numpy or dask.array) backing ``a``."""
+    if hasattr(a, "dask"):
+        import dask.array as dask_array
+
+        return dask_array
+    return np
+
+
+def _check_and_align_target_bins(target_theta_bins):
+    """Validate target bins column by column and align them for the
+    column-wise numba kernel.
+
+    The target bins may carry horizontal/time dimensions in addition to the
+    bin dimension, so that each column can define its own target cell
+    boundaries. The following explicit rules are applied to every column:
+
+    - A column containing any NaN is considered a *missing* column. Its
+      monotonicity is not checked and the corresponding output column is
+      filled entirely with NaN.
+    - Every non-missing column needs at least two boundaries and has to be
+      either strictly increasing or strictly decreasing. Columns with
+      different numbers of non-NaN boundaries cannot coexist because they
+      cannot share a single output dimension.
+    - Strictly decreasing columns are reversed (the resulting output is
+      reversed back later, so values stay attached to the user-provided
+      bin order).
+
+    Both numpy and dask arrays are accepted. The validation itself only
+    evaluates small derived arrays (per-column booleans/counts), so for dask
+    inputs the full bin array is never materialized; the returned aligned bins,
+    flip and missing arrays stay lazy and preserve the input chunking, which is
+    what allows the downstream chunk-wise gufunc to match an eager column loop.
+
+    Parameters
+    ----------
+    target_theta_bins : np.ndarray or dask.array.Array
+        Array of shape (..., m) of target cell boundaries. The last
+        dimension is the bin dimension.
+
+    Returns
+    -------
+    aligned_bins : array
+        Array with the same shape/chunking as the input, with each
+        non-missing column arranged in strictly increasing order. Missing
+        columns are kept as NaN.
+    flip : array of bool
+        Boolean array of shape (...) flagging the columns that were
+        decreasing and had to be reversed.
+    missing : array of bool
+        Boolean array of shape (...) flagging missing (NaN-containing)
+        columns.
+    """
+    xp = _array_module(target_theta_bins)
+
+    if target_theta_bins.ndim == 0 or target_theta_bins.shape[-1] < 2:
+        raise ValueError(
+            "`target_theta_bins` needs at least two boundary values "
+            f"along its last dimension, got shape {target_theta_bins.shape}."
+        )
+
+    # Evaluate small per-column scalar flags. For dask these are reductions
+    # over derived arrays; only the small boolean/count results are computed,
+    # the full bin array stays lazy.
+    def _value(x):
+        return x.compute() if hasattr(x, "dask") else x
+
+    nan_mask = xp.isnan(target_theta_bins)
+    missing = xp.any(nan_mask, axis=-1)
+    counts = xp.sum(~nan_mask, axis=-1)
+
+    # Boundary-count consistency. Fully missing columns (count 0) are exempt;
+    # every column with at least one boundary must share the same count. This
+    # is expressed with scalar reductions (min/max over distinct valid counts)
+    # so it works identically for numpy and dask without boolean indexing,
+    # which would produce unknown chunk sizes in dask.
+    has_valid = _value(xp.any(counts > 0))
+    if has_valid:
+        if xp is np:
+            distinct = np.unique(counts[counts > 0])
+            mismatch = distinct.size > 1
+        else:
+            # dask: a single valid count means min equals max over the valid
+            # columns; this avoids boolean indexing (unknown chunk sizes).
+            positive = counts[counts > 0]
+            mismatch = _value(positive.min() != positive.max())
+        if mismatch:
+            raise ValueError(
+                "The columns of `target_theta_bins` do not all define the same "
+                "number of boundaries. Columns that are entirely NaN (missing "
+                "columns) are allowed, but every other column must define the "
+                "same number of boundaries. Got per-column non-NaN counts "
+                f"{_value(counts)}."
+            )
+
+    diffs = xp.diff(target_theta_bins, axis=-1)
+    increasing = xp.all(diffs > 0, axis=-1)
+    decreasing = xp.all(diffs < 0, axis=-1)
+
+    # NaNs propagate through the comparisons; missing columns are excluded.
+    valid = ~missing
+    non_monotonic = valid & ~(increasing | decreasing)
+    if _value(xp.any(non_monotonic)):
+        if xp is np:
+            bad_index = np.argwhere(non_monotonic)
+            index_msg = (
+                f"The first non-monotonic column is at index "
+                f"{tuple(bad_index[0])}. "
+            )
+        else:
+            index_msg = ""
+        raise ValueError(
+            "Target values are not strictly monotonic in every column. "
+            + index_msg
+            + "Each column of `target_theta_bins` must be either strictly "
+            "increasing or strictly decreasing."
+        )
+
+    flip = valid & decreasing
+    if xp is np:
+        aligned_bins = target_theta_bins.copy()
+        if np.any(flip):
+            aligned_bins[flip] = target_theta_bins[flip][:, ::-1]
+    else:
+        # dask: reverse the decreasing columns inside each chunk. map_blocks
+        # keeps the operation lazy and preserves chunking (boolean-mask
+        # assignment would require unknown chunk sizes).
+        import dask.array as dask_array
+
+        def _align_block(bins_block):
+            nan_block = np.any(np.isnan(bins_block), axis=-1)
+            diff_block = np.diff(bins_block, axis=-1)
+            dec_block = np.all(diff_block < 0, axis=-1)
+            flip_block = (~nan_block) & dec_block
+            if np.any(flip_block):
+                bins_block = bins_block.copy()
+                bins_block[flip_block] = bins_block[flip_block][:, ::-1]
+            return bins_block
+
+        aligned_bins = dask_array.map_blocks(
+            _align_block, target_theta_bins, dtype=target_theta_bins.dtype
+        )
+
+    return aligned_bins, flip, missing
+
+
 def interp_1d_conservative(phi, theta, target_theta_bins):
     """
     Accumulate extensive cell-centered quantity phi into new vertical coordinate
@@ -156,38 +302,160 @@ def interp_1d_conservative(phi, theta, target_theta_bins):
         Array of shape (..., n+1) giving values of scalar theta  on the
         cell vertices. Phi is assumed to vary linearly between vertices.
     target_theta_bins : array_like
-        Array of shape (m) defining the bounds of bins in which to accumulate
-        phi.
+        Array of shape (..., m) defining the bounds of bins in which to
+        accumulate phi. In addition to the (last) bin dimension it may carry
+        horizontal and/or time dimensions, allowing each column to define its
+        own target cell boundaries. Boundary arrays are validated column by
+        column: every non-missing column must be strictly monotonic (either
+        increasing or decreasing) and all columns must define the same number
+        of boundaries. Columns containing NaN boundaries are treated as
+        missing and produce an all-NaN output column. Leading dimensions of
+        `phi`, `theta` and `target_theta_bins` are broadcast against each
+        other following numpy broadcasting rules.
 
     Returns
     -------
     phi_accum : array_like
         Array of shape (..., m-1) giving the values of phi partitioned into
-        specified theta bins.
+        specified theta bins. For decreasing target bins the output order
+        matches the user-provided bin order.
     """
 
     assert phi.shape[-1] == (theta.shape[-1] - 1)
-    assert target_theta_bins.ndim == 1
 
-    # flip target_theta_bins if needed (only needed for the conservative method,
-    # np.interp handles this by itself)
-    target_diff = np.diff(target_theta_bins)
-    if all(target_diff < 0):
-        flip_switch = True
-        target_theta_bins = target_theta_bins[::-1]
-    elif all(target_diff > 0):
-        flip_switch = False
+    if np.asarray(target_theta_bins).ndim == 1:
+        # keep the original, well established code path for 1D targets.
+        # np.asarray only triggers a computation for a 1D dask array, which is
+        # acceptable because the target carries no chunked loop dimension here.
+        target_theta_bins = np.asarray(target_theta_bins)
+        target_diff = np.diff(target_theta_bins)
+        if all(target_diff < 0):
+            flip_switch = True
+            target_theta_bins = target_theta_bins[::-1]
+        elif all(target_diff > 0):
+            flip_switch = False
+        else:
+            raise ValueError("Target values are not monotonic")
+
+        theta_1 = theta[..., :-1]
+        theta_2 = theta[..., 1:]
+        theta_hat_1 = target_theta_bins[:-1]
+        theta_hat_2 = target_theta_bins[1:]
+
+        out = _interp_1d_conservative(
+            phi, theta_1, theta_2, theta_hat_1, theta_hat_2
+        )
+        if flip_switch:
+            out = out[::-1]
+        return out
+
+    # multi-dimensional target: each column may define its own boundaries.
+    # The validation stays lazy for dask inputs and preserves chunking.
+    aligned_bins, flip, missing = _check_and_align_target_bins(target_theta_bins)
+
+    # choose a single array module for broadcasting. If any input is dask we
+    # use dask for all of them so that the loop dimensions carry aligned
+    # chunking (the gufunc rejects mismatched chunks); otherwise plain numpy.
+    is_dask = any(
+        hasattr(a, "dask") for a in (phi, theta, aligned_bins, flip, missing)
+    )
+    if is_dask:
+        import dask.array as dask_array
+
+        xp = dask_array
     else:
-        raise ValueError("Target values are not monotonic")
+        xp = np
 
-    theta_1 = theta[..., :-1]
-    theta_2 = theta[..., 1:]
-    theta_hat_1 = target_theta_bins[:-1]
-    theta_hat_2 = target_theta_bins[1:]
+    # broadcast the leading (horizontal/time) dimensions of all inputs so that
+    # every column is paired with its own set of boundaries.
+    batch_shape = np.broadcast_shapes(
+        np.shape(phi)[:-1],
+        np.shape(theta)[:-1],
+        target_theta_bins.shape[:-1],
+    )
+    phi_b = xp.broadcast_to(phi, batch_shape + (phi.shape[-1],))
+    theta_b = xp.broadcast_to(theta, batch_shape + (theta.shape[-1],))
+    bins_b = xp.broadcast_to(
+        aligned_bins, batch_shape + (aligned_bins.shape[-1],)
+    )
+    flip_b = xp.broadcast_to(flip, batch_shape)
+    missing_b = xp.broadcast_to(missing, batch_shape)
 
-    out = _interp_1d_conservative(phi, theta_1, theta_2, theta_hat_1, theta_hat_2)
-    if flip_switch:
-        out = out[::-1]
+    if is_dask:
+        # A numpy input broadcast with dask becomes a single chunk, which
+        # clashes with the (finer) chunks of the dask inputs. Rechunk every
+        # leading (loop) axis to the finest chunk size shared by all arrays,
+        # while leaving the core (last) dimensions in one piece as the
+        # column-wise gufunc requires.
+        lead_ndim = len(batch_shape)
+        ref_chunks = []
+        for axis in range(lead_ndim):
+            sizes = []
+            for arr in (phi_b, theta_b, bins_b, flip_b, missing_b):
+                sizes.append(min(arr.chunks[axis]))
+            ref_chunks.append(min(sizes))
+
+        def _rechunk_lead(arr):
+            # keep every core (trailing) dimension in a single piece; only
+            # realign the leading loop dimensions
+            core_chunks = arr.chunks[lead_ndim:]
+            return arr.rechunk(tuple(ref_chunks) + core_chunks)
+
+        phi_b = _rechunk_lead(phi_b)
+        theta_b = _rechunk_lead(theta_b)
+        bins_b = _rechunk_lead(bins_b)
+        flip_b = flip_b.rechunk(tuple(ref_chunks))
+        missing_b = missing_b.rechunk(tuple(ref_chunks))
+
+    theta_1 = theta_b[..., :-1]
+    theta_2 = theta_b[..., 1:]
+    theta_hat_1 = bins_b[..., :-1]
+    theta_hat_2 = bins_b[..., 1:]
+
+    out = _interp_1d_conservative(
+        phi_b, theta_1, theta_2, theta_hat_1, theta_hat_2
+    )
+
+    if xp is np:
+        # reverse the output of columns whose target bins were given in
+        # decreasing order, so the result follows the user-provided bin order
+        if np.any(flip_b):
+            out[flip_b] = out[flip_b][:, ::-1]
+        # missing target columns propagate as an all-NaN output column
+        if np.any(missing_b):
+            out[missing_b] = np.nan
+    else:
+        # apply the per-column flip/missing treatment inside each chunk to
+        # stay lazy and keep chunking (boolean-mask assignment on a dask array
+        # requires unknown chunk sizes). The boolean flags are broadcast to the
+        # full output shape first so map_blocks receives arrays with identical
+        # core dimensions instead of mixing in lower-dimensional arguments.
+        def _postprocess(out_block, flip_block, missing_block):
+            flip_col = flip_block[..., 0]
+            missing_col = missing_block[..., 0]
+            if np.any(flip_col):
+                out_block = out_block.copy()
+                out_block[flip_col] = out_block[flip_col][:, ::-1]
+            if np.any(missing_col):
+                out_block = out_block.copy()
+                out_block[missing_col] = np.nan
+            return out_block
+
+        target_shape = out.shape
+        flip_full = dask_array.broadcast_to(
+            flip_b[..., None], target_shape
+        )
+        missing_full = dask_array.broadcast_to(
+            missing_b[..., None], target_shape
+        )
+        out = dask_array.map_blocks(
+            _postprocess,
+            out,
+            flip_full,
+            missing_full,
+            dtype=out.dtype,
+        )
+
     return out
 
 
@@ -221,6 +489,28 @@ def input_handling(func):
         # rename back to original name
         value = value.rename({temp_dim: target_dim})
 
+        # the cell bounds are stored as an attribute; rename their key and
+        # internal dimension back to the user-provided target dimension name
+        bounds_attr = temp_dim + "_bounds"
+        if bounds_attr in value.attrs:
+            bounds = value.attrs.pop(bounds_attr).rename(
+                {bounds_attr: target_dim + "_bounds"}
+            )
+            value.attrs[target_dim + "_bounds"] = bounds
+
+        # when the target is multidimensional its name (e.g. an isosurface
+        # coordinate like ``interface_depth_rho``) differs from the target bin
+        # dimension name; the center coordinate keeps that target name, mirroring
+        # the linear interpolation behavior, while the dimension itself keeps the
+        # target dimension name.
+        center_attr = temp_dim + "_center_name"
+        if center_attr in value.attrs:
+            center_name = value.attrs.pop(center_attr)
+            if center_name is not None and center_name != target_dim:
+                value = value.assign_coords(
+                    {center_name: value.coords[target_dim]}
+                ).reset_coords(target_dim, drop=True)
+
         # name the output according to input name and user customizable suffix
         if phi.name:
             value.name = phi.name + suffix
@@ -253,6 +543,13 @@ def linear_interpolation(
 def conservative_interpolation(
     phi, theta, target_theta_levels, phi_dim, theta_dim, target_dim, **kwargs
 ):
+    # the target can be 1D (identical bounds for every column) or carry
+    # horizontal/time dimensions in addition to the (last) bin dimension.
+    # In the latter case every column defines its own target boundaries.
+    n_bounds = target_theta_levels.sizes[target_dim]
+
+    # The numba kernel is column-wise, so only the bin dimension is a core
+    # dimension; all other (horizontal/time) dimensions are broadcast by numpy.
     out = xr.apply_ufunc(
         interp_1d_conservative,
         phi,
@@ -262,16 +559,37 @@ def conservative_interpolation(
         input_core_dims=[[phi_dim], [theta_dim], [target_dim]],
         output_core_dims=[["remapped"]],
         dask="parallelized",
-        dask_gufunc_kwargs={"output_sizes": {"remapped": len(target_theta_levels) - 1}},
+        dask_gufunc_kwargs={"output_sizes": {"remapped": n_bounds - 1}},
         # Since we are introducing a new dimension instead of changing it we need to declare the output size.
         output_dtypes=[phi.dtype],
     ).rename({"remapped": target_dim})
 
-    # assign the target cell center
-    target_centers = (target_theta_levels.data[1:] + target_theta_levels.data[:-1]) / 2
-    out = out.assign_coords({target_dim: target_centers})
+    # assign the per-column target cell centers. For a multidimensional target
+    # these are themselves multidimensional: each column keeps its own centers
+    # instead of reusing the first column's values. The center coordinate may
+    # therefore carry the same horizontal/time dimensions as the target.
+    center_dims = tuple(
+        d for d in target_theta_levels.dims if d != target_dim
+    ) + (target_dim,)
+    target_centers = (
+        target_theta_levels.isel({target_dim: slice(1, None)}).data
+        + target_theta_levels.isel({target_dim: slice(0, -1)}).data
+    ) / 2
+    out = out.assign_coords({target_dim: (center_dims, target_centers)})
 
-    # TODO: Somehow preserve the original bounds
+    # remember the target's own name so the decorator can rename the center
+    # coordinate to it (e.g. a multidim isosurface coordinate); for a 1D target
+    # the name equals the target dimension and no rename is needed.
+    out.attrs[target_dim + "_center_name"] = target_theta_levels.name
+
+    # preserve the corresponding per-column cell bounds. Since the output only
+    # carries the m-1 cell centers along `target_dim`, the m boundaries cannot
+    # be stored as an ordinary coordinate (its vertex dimension would be larger
+    # than the data dimension); they are attached as a DataArray attribute.
+    # For multidimensional targets the bounds retain the horizontal/time dims.
+    out.attrs[target_dim + "_bounds"] = target_theta_levels.rename(
+        {target_dim: target_dim + "_bounds"}
+    )
 
     return out
 
@@ -323,8 +641,20 @@ def transform(
       velocity). N given `target` values are interpreted as cell-bounds
       and the returned array will have N-1 elements along the newly
       created coordinate, with coordinate values that are interpolated
-      between `target` values. This method does currently not work
-      for multi-dimensional targets.
+      between `target` values. The `target` may be one-dimensional (the
+      same boundaries are then used for every column) or carry horizontal
+      and/or time dimensions so that each column defines its own target
+      cell boundaries. In the multidimensional case the boundaries are
+      validated column by column: every non-missing column must be
+      strictly monotonic (either increasing or decreasing) and all
+      columns must define the same number of boundaries. A column that
+      contains NaN boundaries is treated as missing and produces an
+      all-NaN output column. Leading dimensions of `da`, `target_data`
+      and `target` are broadcast following numpy broadcasting rules.
+      The output stores the per-column cell centers as its coordinate and
+      the corresponding per-column cell bounds as the
+      `<target_dim>_bounds` attribute. With fully covering target bins the
+      total of each column is conserved.
     Parameters
     ----------
     grid : xgcm.Grid
@@ -434,10 +764,11 @@ def transform(
                     if target_dim is None:
                         target_dim = list(target.dims)[0]
                 else:
-                    if target_dim is not None and target_dim not in target.dims:
-                        raise ValueError(
-                            f"The specified `target_dim` {target_dim} is not within the dimensions of the target: [{target.dims}]."
-                        )
+                    raise ValueError(
+                        "When `target` is multi-dimensional, `target_dim` has "
+                        "to be set explicitly to specify which of its "
+                        f"dimensions {target.dims} is the target bin dimension."
+                    )
             else:
                 # if the target is not provided as xr.Dataarray we take the name of the target_data as new dimension name
                 _target_data_name_handling(target_data)
@@ -445,6 +776,12 @@ def transform(
         if not isinstance(target, xr.DataArray):
             target = xr.DataArray(
                 target, dims=[target_dim], coords={target_dim: target}
+            )
+
+        if target_dim not in target.dims:
+            raise ValueError(
+                f"The specified `target_dim` {target_dim!r} is not within the "
+                f"dimensions of the target: {target.dims}."
             )
 
         _check_other_dims(target_data)
@@ -467,11 +804,8 @@ def transform(
             logarithmic=(method == "log"),
         )
     elif method == "conservative":
-        if isinstance(target, xr.DataArray):
-            if len(target.dims) > 1:
-                raise NotImplementedError(
-                    "Conservative transformation is not yet supported for multi-dimensional targets."
-                )
+        # Multi-dimensional targets are supported: each column may define its
+        # own target cell boundaries (validated column by column further down).
 
         # the conservative method requires `target_data` to be on the `outer` coordinate.
         # If that is not the case (a very common use case like transformation on any tracer),

@@ -1723,7 +1723,10 @@ class Grid:
           velocity). N given `target` values are interpreted as cell-bounds
           and the returned array will have N-1 elements along the newly
           created coordinate, with coordinate values that are interpolated
-          between `target` values.
+          between `target` values. The `target` may carry horizontal and/or
+          time dimensions so that each column defines its own target cell
+          boundaries; the boundaries are then validated column by column and
+          the per-column cell centers and bounds are preserved on the output.
 
         Parameters
         ----------

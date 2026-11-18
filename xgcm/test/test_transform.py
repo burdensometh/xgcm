@@ -767,16 +767,10 @@ def construct_test_source_data(case_param_dict):
     )
 
 
-# TODO: once conservative method is implemented for multi-dimensional
-# targets, remove the exception from this list
-@pytest.fixture(
-    params=[
-        c
-        for c in list(cases.keys())
-        if not ("conservative" in c and "multidim_target" in c)
-    ],
-)
-def all_cases_except_conservative_multidim(request):
+# Conservative transformation now supports multi-dimensional targets, so the
+# high level grid.transform test runs over every case.
+@pytest.fixture(params=list(cases.keys()))
+def all_transform_cases(request):
     return construct_test_source_data(cases[request.param])
 
 
@@ -1050,9 +1044,9 @@ def test_mid_level_conservative(conservative_cases):
 
 
 @pytest.mark.skipif(numba is None, reason="numba required")
-def test_grid_transform(all_cases_except_conservative_multidim):
+def test_grid_transform(all_transform_cases):
     source, grid_kwargs, target, transform_kwargs, expected, error_flag = (
-        all_cases_except_conservative_multidim
+        all_transform_cases
     )
 
     axis = list(grid_kwargs["coords"].keys())[0]
@@ -1069,17 +1063,175 @@ def test_grid_transform(all_cases_except_conservative_multidim):
 
 
 @pytest.mark.skipif(numba is None, reason="numba required")
-def test_conservative_interp_error_if_multidim_target_dim(conservative_multidim_cases):
+def test_conservative_interp_multidim_target(conservative_multidim_cases):
+    """A multi-dimensional target defines per-column target cell bounds.
+
+    The conservative transformation has to use the boundaries of each column
+    individually (never the first column's bounds for all columns), assign the
+    extensive quantity by the true per-column overlap and conserve the column
+    totals when the target bins fully cover the source range.
+    """
     source, grid_kwargs, target, transform_kwargs, expected, error_flag = (
         conservative_multidim_cases
     )
 
     axis = list(grid_kwargs["coords"].keys())[0]
+    (target_dim,) = [d for d in target.dims if d == transform_kwargs["target_dim"]]
 
     grid = Grid(source, **grid_kwargs)
 
-    with pytest.raises(NotImplementedError):
+    transformed = grid.transform(source.data, axis, target, **transform_kwargs)
+    xr.testing.assert_allclose(transformed, expected.data)
+
+    # each column keeps its own cell centers, i.e. the centers are genuinely
+    # multi-dimensional and differ between columns
+    centers = transformed.coords[target.name]
+    assert centers.dims == expected[target.name].dims
+    assert not np.allclose(centers.values[0], centers.values[1])
+    xr.testing.assert_allclose(centers, expected[target.name])
+
+    # the corresponding per-column cell bounds are preserved and match the
+    # target input column by column (no first-column substitution)
+    bounds = transformed.attrs[target_dim + "_bounds"]
+    assert target_dim + "_bounds" in bounds.dims
+    np.testing.assert_allclose(
+        bounds.rename({target_dim + "_bounds": target_dim}).values,
+        target[target.name].values,
+    )
+
+    # conservation of the extensive quantity within each column
+    horizontal_dim = [d for d in transformed.dims if d != target_dim][0]
+    source_vertical_dim = [d for d in source.data.dims if d != horizontal_dim][0]
+    np.testing.assert_allclose(
+        transformed.sum(target_dim).values,
+        source.data.sum(source_vertical_dim).values,
+    )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_conservative_interp_multidim_target_requires_target_dim():
+    """A multi-dimensional target without an explicit `target_dim` raises."""
+    source, grid_kwargs, target, transform_kwargs, _, _ = construct_test_source_data(
+        cases["conservative_depth_depth_multidim_target"]
+    )
+    axis = list(grid_kwargs["coords"].keys())[0]
+    grid = Grid(source, **grid_kwargs)
+    transform_kwargs.pop("target_dim")
+
+    with pytest.raises(ValueError, match="target_dim"):
         _ = grid.transform(source.data, axis, target, **transform_kwargs)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_interp_1d_conservative_multidim_column_validation():
+    """Column by column validation of monotonicity and boundary counts."""
+    phi = np.array([[1.0, 4.0, 0.0], [1.0, 4.0, 0.0]])
+    theta = np.array([[0.0, 10.0, 50.0, 75.0], [0.0, 10.0, 50.0, 75.0]])
+
+    # a non-monotonic column has to raise, even if another column is fine
+    bad_bins = np.array([[0, 10, 50, 75], [0, 50, 20, 75]])
+    with pytest.raises(ValueError, match="strictly monotonic"):
+        interp_1d_conservative(phi, theta, bad_bins)
+
+    # columns with different numbers of (non-missing) boundaries cannot share
+    # a single output dimension
+    uneven_bins = np.array(
+        [[0, 10, 50, 75], [0, 25, 75, np.nan]]
+    )
+    with pytest.raises(ValueError, match="same number of boundaries"):
+        interp_1d_conservative(phi, theta, uneven_bins)
+
+    # a strictly decreasing column is accepted and the output follows the
+    # user-provided (descending) bin order
+    descending_bins = np.array([[75, 50, 10, 0], [0, 10, 50, 75]])
+    out = interp_1d_conservative(phi, theta, descending_bins)
+    ascending = interp_1d_conservative(phi, theta, np.array([[0, 10, 50, 75]]))
+    np.testing.assert_allclose(out[0], ascending[0][::-1])
+    np.testing.assert_allclose(out[1], ascending[0])
+
+    # a missing column (NaN boundaries) produces an all-NaN output column and
+    # does not affect the other column
+    missing_bins = np.array([[0, 10, 50, 75], [np.nan] * 4])
+    with np.errstate(invalid="ignore"):
+        out_missing = interp_1d_conservative(phi, theta, missing_bins)
+    np.testing.assert_allclose(out_missing[0], ascending[0])
+    assert np.all(np.isnan(out_missing[1]))
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_interp_1d_conservative_multidim_broadcast_and_dask():
+    """Dask chunked results match a column by column execution, including
+    numpy broadcasting of a 1D target across horizontal dimensions and a
+    target that only spans a subset of the horizontal dimensions."""
+    import dask.array as dda
+
+    ncol, nz, nbins = 6, 4, 5
+    rng = np.random.default_rng(0)
+    phi = rng.random((ncol, nz))
+    theta = np.sort(rng.random((ncol, nz + 1)), axis=-1)
+    bins_1d = np.linspace(0.0, 1.0, nbins)
+
+    # numpy reference: loop over columns with the shared 1D target
+    ref = np.stack(
+        [interp_1d_conservative(phi[i], theta[i], bins_1d) for i in range(ncol)]
+    )
+
+    # vectorized call broadcasting the 1D bin array against the columns
+    vectorized = interp_1d_conservative(phi, theta, bins_1d)
+    np.testing.assert_allclose(vectorized, ref)
+
+    # dask chunking along the horizontal dimension must give identical results
+    phi_d = dda.from_array(phi, chunks=(2, nz))
+    theta_d = dda.from_array(theta, chunks=(2, nz + 1))
+    out_dask = interp_1d_conservative(phi_d, theta_d, bins_1d)
+    assert hasattr(out_dask, "compute")
+    np.testing.assert_allclose(out_dask.compute(), ref)
+
+    # a 2D target whose leading dimension broadcasts (one set of bins reused
+    # for all columns) must also match
+    bins_2d = np.broadcast_to(bins_1d, (ncol, nbins))
+    np.testing.assert_allclose(
+        interp_1d_conservative(phi, theta, bins_2d), ref
+    )
+
+    # per-column distinct bins through dask
+    bins_per_col = np.stack(
+        [np.linspace(0.0, 1.0, nbins) + 0.0 for _ in range(ncol)]
+    )
+    bins_per_col[:, -1] = np.linspace(0.9, 1.1, ncol)
+    ref_per_col = np.stack(
+        [
+            interp_1d_conservative(phi[i], theta[i], bins_per_col[i])
+            for i in range(ncol)
+        ]
+    )
+    bins_d = dda.from_array(bins_per_col, chunks=(2, nbins))
+    out_per_col = interp_1d_conservative(phi_d, theta_d, bins_d)
+    np.testing.assert_allclose(out_per_col.compute(), ref_per_col)
+
+    # mixed backends: numpy data with a dask target and vice versa. The dask
+    # path has to realign the single-chunk numpy inputs with the dask chunks.
+    np.testing.assert_allclose(
+        interp_1d_conservative(phi, theta, bins_d).compute(), ref_per_col
+    )
+    np.testing.assert_allclose(
+        interp_1d_conservative(phi_d, theta_d, bins_per_col).compute(),
+        ref_per_col,
+    )
+
+    # an extra leading (time) dimension that the target does not span: chunked
+    # dask result must match the numpy-broadcast reference column by column.
+    nt = 2
+    phi3 = rng.random((nt, ncol, nz))
+    theta3 = np.sort(rng.random((nt, ncol, nz + 1)), axis=-1)
+    ref3 = interp_1d_conservative(phi3, theta3, bins_per_col)
+    out3 = interp_1d_conservative(
+        dda.from_array(phi3, chunks=(1, 2, nz)),
+        dda.from_array(theta3, chunks=(1, 2, nz + 1)),
+        bins_d,
+    )
+    assert out3.shape == (nt, ncol, nbins - 1)
+    np.testing.assert_allclose(out3.compute(), ref3)
 
 
 @pytest.mark.skipif(numba is None, reason="numba required")
@@ -1422,3 +1574,113 @@ def test_grid_transform_input_check():
     )
     with pytest.raises(ValueError, match=match_msg):
         grid.transform(source.data, axis, target, **transform_kwargs)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_conservative_multidim_target_full_stack_dask():
+    """Per-column target bounds through the full Grid.transform stack.
+
+    Covers: broadcasting of the target over a time dimension it does not
+    span, equality between dask-chunked and eager (column-wise) execution,
+    per-column conservation under full coverage, and preservation of the
+    per-column centers and bounds.
+    """
+    nt, nx, nz, nbo = 2, 4, 3, 4
+    rng = np.random.default_rng(1)
+    ds = xr.Dataset(
+        {
+            "data": (("time", "x", "z"), rng.random((nt, nx, nz))),
+            "zc": (("zc",), np.array([0.0, 10.0, 50.0, 75.0])),
+        },
+        coords={"z": ("z", [5, 25, 60])},
+    )
+    grid_kwargs = {"coords": {"Z": {"center": "z", "outer": "zc"}},
+                   "autoparse_metadata": False}
+    grid = Grid(ds, **grid_kwargs)
+
+    # per-column bounds spanning only (x, s_w): they broadcast over `time`
+    bins = np.broadcast_to(np.linspace(0.0, 75.0, 5), (nx, 5)).copy()
+    bins[:, -1] = np.linspace(70.0, 90.0, nx)
+    target = xr.DataArray(bins, dims=["x", "s_w"], name="interface_depth")
+
+    kw = dict(method="conservative", target_data=ds.zc, target_dim="s_w")
+    eager = grid.transform(ds.data, "Z", target, **kw)
+
+    # chunk along both horizontal/time dims; the target stays per-column
+    ds_d = ds.chunk({"x": 2, "time": 1})
+    lazy = grid.transform(ds_d.data, "Z", target, **kw)
+    assert hasattr(lazy.data, "dask")
+    xr.testing.assert_allclose(lazy.compute(), eager)
+
+    # a dask-backed target has to give the identical answer
+    lazy_target = grid.transform(
+        ds_d.data, "Z", target.chunk({"x": 2}), **kw
+    )
+    xr.testing.assert_allclose(lazy_target.compute(), eager)
+
+    # time dimension is present on the output even though the target lacks it
+    assert "time" in eager.dims and "x" in eager.dims
+    assert eager.sizes["s_w"] == 4
+
+    # per-column centers differ between columns and are preserved
+    centers = eager.coords["interface_depth"]
+    assert centers.dims == ("x", "s_w")
+    assert not np.allclose(centers.values[0], centers.values[1])
+
+    # per-column bounds are preserved and match the target column by column
+    bounds = eager.attrs["s_w_bounds"]
+    np.testing.assert_allclose(
+        bounds.rename({"s_w_bounds": "s_w"}).values, bins
+    )
+
+    # full coverage: each (time, x) column conserves its total
+    full_bins = np.broadcast_to(
+        np.array([0.0, 10.0, 50.0, 75.0]), (nx, 4)
+    ).copy()
+    full_target = xr.DataArray(full_bins, dims=["x", "s_w"], name="interface_depth")
+    out_full = grid.transform(ds.data, "Z", full_target, **kw)
+    np.testing.assert_allclose(
+        out_full.sum("s_w").values, ds.data.sum("z").values
+    )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_conservative_multidim_target_1d_backward_compat():
+    """A plain 1D target keeps working and is equivalent to broadcasting it."""
+    nx, nz = 3, 3
+    rng = np.random.default_rng(2)
+    ds = xr.Dataset(
+        {
+            "data": (("x", "z"), rng.random((nx, nz))),
+            "zc": (("zc",), np.array([0.0, 10.0, 50.0, 75.0])),
+        },
+        coords={"z": ("z", [5, 25, 60])},
+    )
+    grid = Grid(
+        ds,
+        coords={"Z": {"center": "z", "outer": "zc"}},
+        autoparse_metadata=False,
+    )
+    bins_1d = np.array([0.0, 10.0, 50.0, 75.0])
+    target_1d = xr.DataArray(bins_1d, dims=["s_w"])
+
+    out_1d = grid.transform(
+        ds.data, "Z", target_1d, method="conservative",
+        target_data=ds.zc, target_dim="s_w",
+    )
+
+    bins_2d = np.broadcast_to(bins_1d, (nx, 4)).copy()
+    target_2d = xr.DataArray(bins_2d, dims=["x", "s_w"], name="s_w")
+    out_2d = grid.transform(
+        ds.data, "Z", target_2d, method="conservative",
+        target_data=ds.zc, target_dim="s_w",
+    )
+    np.testing.assert_allclose(out_1d.values, out_2d.values)
+
+    # both conserve the column totals (full coverage)
+    np.testing.assert_allclose(
+        out_1d.sum("s_w").values, ds.data.sum("z").values
+    )
+    np.testing.assert_allclose(
+        out_2d.sum("s_w").values, ds.data.sum("z").values
+    )

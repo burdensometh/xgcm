@@ -5,6 +5,21 @@
 
 ### New Features
 
+- `Grid.transform(..., method="conservative")` now accepts multi-dimensional
+  target cell boundaries that carry horizontal and/or time dimensions. Each
+  column can therefore define its own target bins instead of reusing a single
+  1D boundary array for every column. Boundaries are validated column by
+  column: every non-missing column must be strictly monotonic (increasing or
+  decreasing) and all columns must define the same number of boundaries;
+  columns containing NaN boundaries are treated as missing and produce an
+  all-NaN output column. Leading dimensions of the data, target data and
+  target are broadcast following numpy rules, including under dask chunking,
+  where chunked results match an eager column-by-column execution. The output
+  preserves the per-column cell centers as its coordinate and the
+  corresponding per-column cell bounds as the `<target_dim>_bounds`
+  attribute. With fully covering bins the extensive quantity is conserved per
+  column.
+
 ### Breaking Changes
 
 ### Internal Changes
