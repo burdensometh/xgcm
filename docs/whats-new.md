@@ -5,6 +5,23 @@
 
 ### New Features
 
+- `Grid.transform` with `method="conservative"` now supports intensive
+  quantities (concentrations) via the new `quantity="intensive"` mode.
+  Because a concentration cannot be remapped directly as if it were
+  extensive, it is first multiplied with the source effective volume (the
+  grid metric registered along the transform axis) to form a total amount;
+  the total amount and the effective volume are then remapped independently
+  with the unchanged conservative kernel, and the target concentration is
+  their ratio. A `coverage_threshold` (default 1.0) declares target bins
+  with insufficient source coverage as missing (`NaN`); a zero-coverage bin
+  is always missing and can never produce a zero concentration. With
+  `return_effective_volume=True` the remapped effective volume (finite
+  everywhere; zero where nothing contributes) is returned as well and can be
+  registered on a target grid with the new `xgcm.transform.target_grid`
+  helper, so subsequent `Grid.average` / `Grid.integrate` calls use the same
+  partial-coverage accounting as the remap. The previous extensive behavior
+  is unchanged (`quantity="extensive"`, the default).
+
 ### Breaking Changes
 
 ### Internal Changes

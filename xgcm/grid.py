@@ -1717,13 +1717,27 @@ class Grid:
 
         - 'conservative': Values are transformed while conserving the
           integral of `da` along each 1D column. This method can be used
-          with non-monotonic values of `target_data`. Currently this will
-          only work with extensive quantities (like heat, mass, transport)
-          but not with intensive quantities (like temperature, density,
-          velocity). N given `target` values are interpreted as cell-bounds
-          and the returned array will have N-1 elements along the newly
-          created coordinate, with coordinate values that are interpolated
-          between `target` values.
+          with non-monotonic values of `target_data`. N given `target`
+          values are interpreted as cell-bounds and the returned array
+          will have N-1 elements along the newly created coordinate, with
+          coordinate values that are interpolated between `target` values.
+          The `quantity` keyword selects how `da` is interpreted:
+
+          * `quantity='extensive'` (default): `da` is an extensive
+            quantity (like heat, mass, transport), already volume
+            weighted, and is accumulated into the target bins.
+          * `quantity='intensive'`: `da` is an intensive concentration.
+            It is multiplied by the source effective volume (the grid
+            metric along `axis`, which must be registered), the resulting
+            total amount and the effective volume are remapped
+            conservatively and independently, and the target
+            concentration is their ratio. Target bins covered by less
+            than `coverage_threshold` are set to NaN; zero coverage never
+            yields a zero concentration. With
+            `return_effective_volume=True` the remapped effective volume
+            is returned as well and can be registered on a target grid
+            via `xgcm.transform.target_grid`, so that later
+            `average`/`integrate` use the same coverage accounting.
 
         Parameters
         ----------
@@ -1759,11 +1773,28 @@ class Grid:
         suffix : str, optional
             Customizable suffix to the name of the output array. This will
             be added to the original name of `da`. Defaults to `_transformed`.
+        quantity : {'extensive', 'intensive'}, optional
+            Only applies to `method='conservative'`. Whether `da` is an
+            extensive quantity (default, original behavior) or an intensive
+            concentration. The intensive mode requires a volume metric
+            along `axis` to be registered on the grid.
+        coverage_threshold : float, optional
+            Only applies to the intensive conservative mode. Minimum
+            fractional source coverage (between 0 and 1) of a target bin
+            for a concentration to be returned; less-covered bins become
+            NaN. Default 1.0 (only fully covered bins get a value).
+        return_effective_volume : bool, optional
+            Only applies to the intensive conservative mode. If True,
+            return ``(concentration, effective_volume)``; the effective
+            volume can be registered on a target grid with
+            `xgcm.transform.target_grid`. Default False.
 
         Returns
         -------
-        xr.DataArray
-            The transformed data
+        xr.DataArray or tuple of xr.DataArray
+            The transformed data, or a
+            ``(concentration, effective_volume)`` tuple when
+            `return_effective_volume` is True.
 
 
         """

@@ -19,10 +19,13 @@ try:
     import numba  # type: ignore
 
     from ..transform import (
+        conservative_coverage,
         conservative_interpolation,
+        coverage_1d_conservative,
         interp_1d_conservative,
         interp_1d_linear,
         linear_interpolation,
+        target_grid,
     )
 except ImportError:
     numba = None
@@ -1422,3 +1425,617 @@ def test_grid_transform_input_check():
     )
     with pytest.raises(ValueError, match=match_msg):
         grid.transform(source.data, axis, target, **transform_kwargs)
+
+
+"""Tests for the intensive (concentration) conservative remap mode."""
+
+
+def _make_volume_grid(
+    conc_values,
+    volume_values,
+    bounds=(0.0, 10.0, 50.0, 75.0),
+    metric_name="dz",
+    register_metric=True,
+):
+    """Build a minimal 1D vertical grid with a concentration and a volume
+    (cell thickness) metric."""
+    bounds = np.asarray(bounds, dtype=float)
+    centers = 0.5 * (bounds[:-1] + bounds[1:])
+    dim, outer = "z", "zc"
+    conc = xr.DataArray(
+        np.asarray(conc_values, dtype=float),
+        dims=[dim],
+        coords={dim: centers},
+        name="conc",
+    )
+    volume = xr.DataArray(
+        np.asarray(volume_values, dtype=float),
+        dims=[dim],
+        coords={dim: centers},
+        name=metric_name,
+    )
+    ds = xr.Dataset({"conc": conc, metric_name: volume}).assign_coords(
+        {outer: bounds}
+    )
+    metrics = {"Z": [metric_name]} if register_metric else None
+    grid = Grid(
+        ds,
+        coords={"Z": {"center": dim, "outer": outer}},
+        metrics=metrics,
+        autoparse_metadata=False,
+    )
+    return grid, ds, conc, volume
+
+
+# source cells: [0,10] c=1 v=10 ; [10,50] c=4 v=40 ; [50,75] c=2 v=25
+_INTENSIVE_TARGET = np.array([0.0, 1.0, 10.0, 50.0, 80.0])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_coverage_1d_conservative_basic():
+    # plain overlaps: bins 0-1, 1-10, 10-50 are fully inside source cells;
+    # bin 50-80 only overlaps source over 50-75 (25 of 30)
+    theta = np.array([0.0, 10.0, 50.0, 75.0])
+    coverage = coverage_1d_conservative(theta, _INTENSIVE_TARGET)
+    np.testing.assert_allclose(coverage, [1.0, 1.0, 1.0, 25.0 / 30.0])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_coverage_1d_conservative_zero_coverage():
+    # a target extending beyond the source domain must report zero coverage,
+    # never NaN (zero-width bins excepted), so the masking can distinguish
+    # "uncovered" from "no geometry"
+    theta = np.array([0.0, 10.0, 50.0, 75.0])
+    target = np.array([0.0, 10.0, 50.0, 75.0, 100.0])
+    coverage = coverage_1d_conservative(theta, target)
+    np.testing.assert_allclose(coverage, [1.0, 1.0, 1.0, 0.0])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_coverage_1d_conservative_reversed_target():
+    theta = np.array([0.0, 10.0, 50.0, 75.0])
+    forward = coverage_1d_conservative(theta, _INTENSIVE_TARGET)
+    reversed_ = coverage_1d_conservative(theta, _INTENSIVE_TARGET[::-1])
+    np.testing.assert_allclose(forward, reversed_[::-1])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_coverage_matches_amount_overlap_geometry():
+    # remapping an extensive field of ones times the cell extent reproduces
+    # the coverage fraction, proving both kernels use the same geometry
+    theta = np.array([0.0, 10.0, 50.0, 75.0])
+    cell_extents = np.diff(theta)
+    amount = interp_1d_conservative(cell_extents, theta, _INTENSIVE_TARGET)
+    bin_widths = np.diff(_INTENSIVE_TARGET)
+    coverage = coverage_1d_conservative(theta, _INTENSIVE_TARGET)
+    np.testing.assert_allclose(amount / bin_widths, coverage)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_coverage_nonmonotonic_is_multiplicity():
+    # an overturning coordinate maps several source layers onto one target
+    # bin: the geometric coverage is then a multiplicity that can exceed 1
+    theta = np.array([1.0, 3.0, 5.0, 7.0, 5.0, 3.0])
+    target = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
+    coverage = coverage_1d_conservative(theta, target)
+    assert np.any(coverage > 1.0)
+    # while a bin with no overlap remains exactly zero
+    assert coverage[0] == 0.5  # bin 0-2 only half covered by the [1,3] layers
+    assert coverage[-1] == 1.0  # bin 6-8 covered by the [5,7] layer only
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_conservative_coverage_mid_level():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    target = xr.DataArray(_INTENSIVE_TARGET, dims=["zc"])
+    coverage = conservative_coverage(
+        conc, ds["zc"], target, "z", "zc", "zc"
+    )
+    assert coverage.dims == ("zc",)
+    np.testing.assert_allclose(coverage, [1.0, 1.0, 1.0, 25.0 / 30.0])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_conservative_concentration_values():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    transformed = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+    )
+    # fully covered bins keep the concentration of the source cell they
+    # fall into; the partially covered bin is NaN at the default threshold
+    np.testing.assert_allclose(transformed.values[:3], [1.0, 1.0, 4.0])
+    assert np.isnan(transformed.values[3])
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_conservative_partial_coverage_threshold():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    # bin 50-80 is 25/30 ~ 0.833 covered
+    transformed = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.5,
+    )
+    np.testing.assert_allclose(transformed.values, [1.0, 1.0, 4.0, 2.0])
+
+    # threshold above the actual coverage masks the bin again
+    strict = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.9,
+    )
+    assert np.isnan(strict.values[3])
+
+    # threshold of exactly the achieved coverage is accepted (>= comparison)
+    exact = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=25.0 / 30.0,
+    )
+    np.testing.assert_allclose(exact.values[3], 2.0)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_zero_coverage_never_zero_concentration():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    # last bin 75-100 has zero overlap with the source (0-75)
+    target = np.array([0.0, 10.0, 50.0, 75.0, 100.0])
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        target,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+        return_effective_volume=True,
+    )
+    np.testing.assert_allclose(transformed.values[:3], [1.0, 4.0, 2.0])
+    assert np.isnan(transformed.values[3])
+    # zero coverage means zero remapped volume (a physical zero, not a NaN
+    # and not a zero concentration): the volume stays finite so it can be a
+    # metric while the concentration carries the missing-value mask.
+    assert effective_volume.values[3] == 0.0
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_effective_volume_values_and_mask():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        return_effective_volume=True,
+    )
+    # effective volumes are the conservatively remapped source cell volumes
+    np.testing.assert_allclose(effective_volume.values[:3], [1.0, 9.0, 40.0])
+    # the partially covered bin still has a physical volume (25), while the
+    # concentration is masked by the default full-coverage threshold
+    np.testing.assert_allclose(effective_volume.values[3], 25.0)
+    # the volume is finite everywhere so it can be registered as a metric
+    assert np.all(np.isfinite(effective_volume.values))
+    assert effective_volume.name.endswith("effective_volume_transformed")
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_missing_source_values_excluded_consistently():
+    # a NaN source concentration must exclude that cell from BOTH remaps, so
+    # the ratio is never contaminated by it
+    grid, ds, conc, volume = _make_volume_grid(
+        [1.0, np.nan, 2.0], [10.0, 40.0, 25.0]
+    )
+    target = np.array([0.0, 30.0, 50.0, 75.0])
+    transformed = grid.transform(
+        conc,
+        "Z",
+        target,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+    )
+    # bin 0-30: half of cell 0 (c=1) and half of the NaN cell 1. Only the
+    # valid half contributes, so the concentration stays 1
+    np.testing.assert_allclose(transformed.values[0], 1.0)
+    # bin 30-50 lies entirely in the NaN cell -> missing
+    assert np.isnan(transformed.values[1])
+    # bin 50-75 is fully in cell 2 (c=2)
+    np.testing.assert_allclose(transformed.values[2], 2.0)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_conservative_nonmonotonic_target_data():
+    # non-monotonic theta (density overturning): the intensive path must
+    # support this case exactly like the extensive kernel, and reproduce an
+    # independent amount/volume ratio computed from that kernel.
+    bounds = np.array([0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
+    centers = 0.5 * (bounds[:-1] + bounds[1:])
+    volume_values = np.diff(bounds)
+    volume = xr.DataArray(
+        volume_values, dims=["z"], coords={"z": centers}, name="dz"
+    )
+    conc_values = np.array([22.0, 26.0, 30.0, 34.0, 38.0])
+    conc = xr.DataArray(
+        conc_values, dims=["z"], coords={"z": centers}, name="conc"
+    )
+    # non-monotonic density on the outer coordinate
+    dens_outer = xr.DataArray(
+        [1.0, 3.0, 5.0, 7.0, 5.0, 3.0], dims=["zc"]
+    )
+    ds = xr.Dataset({"conc": conc, "dz": volume}).assign_coords(
+        zc=bounds, dens_outer=dens_outer
+    )
+    grid = Grid(
+        ds,
+        coords={"Z": {"center": "z", "outer": "zc"}},
+        metrics={"Z": ["dz"]},
+        autoparse_metadata=False,
+    )
+    target_dens = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
+    transformed = grid.transform(
+        conc,
+        "Z",
+        target_dens,
+        target_data=ds.dens_outer,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+    )
+
+    # independent reference: run the extensive kernel directly on the total
+    # amount and on the volume, then take the ratio
+    ref_amount = interp_1d_conservative(
+        conc_values * volume_values, dens_outer.values, target_dens
+    )
+    ref_volume = interp_1d_conservative(
+        volume_values, dens_outer.values, target_dens
+    )
+    ref_coverage = coverage_1d_conservative(
+        dens_outer.values, target_dens
+    )
+    ref_conc = np.where(
+        (ref_coverage > 0.0) & (ref_volume > 0.0),
+        ref_amount / ref_volume,
+        np.nan,
+    )
+    np.testing.assert_allclose(transformed.values, ref_conc)
+    # the geometry genuinely blends several source cells into one target bin
+    # under non-monotonic stratification, so at least one bin is a mixture
+    assert np.any(
+        (ref_conc[~np.isnan(ref_conc)] > conc_values.min())
+        & (ref_conc[~np.isnan(ref_conc)] < conc_values.max())
+    )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_nonmonotonic_coverage_multiplicity_threshold():
+    # Under an overturning coordinate several source layers map onto one
+    # target bin, so the raw geometric coverage is a multiplicity that can
+    # exceed 1. Such a bin is fully represented and must still pass the
+    # strict full-coverage (1.0) threshold; only genuinely under-covered bins
+    # are masked.
+    bounds = np.array([0.0, 20.0, 40.0, 60.0, 80.0, 100.0])
+    centers = 0.5 * (bounds[:-1] + bounds[1:])
+    dz = xr.DataArray(np.diff(bounds), dims=["z"], coords={"z": centers}, name="dz")
+    conc = xr.DataArray(
+        [22.0, 26.0, 30.0, 34.0, 38.0],
+        dims=["z"],
+        coords={"z": centers},
+        name="conc",
+    )
+    dens_outer = xr.DataArray([1.0, 3.0, 5.0, 7.0, 5.0, 3.0], dims=["zc"])
+    ds = xr.Dataset({"conc": conc, "dz": dz}).assign_coords(
+        zc=bounds, dens_outer=dens_outer
+    )
+    grid = Grid(
+        ds,
+        coords={"Z": {"center": "z", "outer": "zc"}},
+        metrics={"Z": ["dz"]},
+        autoparse_metadata=False,
+    )
+    target_dens = np.array([0.0, 2.0, 4.0, 6.0, 8.0])
+
+    # the low-level geometric coverage is explicitly a multiplicity here
+    multiplicity = coverage_1d_conservative(dens_outer.values, target_dens)
+    assert np.any(multiplicity > 1.0)
+
+    strict, volume = grid.transform(
+        conc,
+        "Z",
+        target_dens,
+        target_data=ds.dens_outer,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=1.0,
+        return_effective_volume=True,
+    )
+    permissive = grid.transform(
+        conc,
+        "Z",
+        target_dens,
+        target_data=ds.dens_outer,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+    )
+    # the first bin is only half covered and is the only strict-threshold NaN
+    assert np.isnan(strict.values[0])
+    assert np.all(np.isfinite(strict.values[1:]))
+    # the permissive threshold fills every non-empty bin
+    assert np.all(np.isfinite(permissive.values))
+    # strict cannot have more valid bins than permissive
+    assert np.sum(np.isfinite(strict.values)) <= np.sum(
+        np.isfinite(permissive.values)
+    )
+    # the effective volume is finite even where the concentration is masked
+    assert np.all(np.isfinite(volume.values))
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_target_grid_registers_effective_volume_for_average_integrate():
+    # target with a fully-covered region plus a zero-coverage tail bin
+    target = np.array([0.0, 10.0, 50.0, 75.0, 100.0])
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        target,
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+        return_effective_volume=True,
+    )
+    tgrid = target_grid(grid, "Z", transformed, effective_volume)
+
+    # the registered metric lives on the target dimension and has zero weight
+    # on the zero-coverage tail bin (75-100)
+    metric = tgrid.get_metric(transformed, "Z")
+    assert metric.dims == transformed.dims
+    np.testing.assert_allclose(metric.values[:3], [10.0, 40.0, 25.0])
+    assert metric.values[3] == 0.0
+
+    # average / integrate use the same effective-volume accounting as the
+    # remap, skipping both the NaN concentration and the zero-weight tail bin
+    valid = np.isfinite(transformed.values)
+    expected_average = np.sum(
+        transformed.values[valid] * effective_volume.values[valid]
+    ) / np.sum(effective_volume.values[valid])
+    expected_integral = np.sum(
+        transformed.values[valid] * effective_volume.values[valid]
+    )
+    np.testing.assert_allclose(tgrid.average(transformed, "Z"), expected_average)
+    np.testing.assert_allclose(
+        tgrid.integrate(transformed, "Z"), expected_integral
+    )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_target_grid_threshold_masked_bins_excluded_from_reductions():
+    # a partially covered bin (25/30) is masked at the strict default
+    # threshold but still carries its physical effective volume. The NaN
+    # concentration must be excluded from average/integrate while the metric
+    # stays finite and usable (no NaN weights).
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        return_effective_volume=True,
+    )
+    tgrid = target_grid(grid, "Z", transformed, effective_volume)
+
+    metric = tgrid.get_metric(transformed, "Z")
+    assert np.all(np.isfinite(metric.values))
+    np.testing.assert_allclose(metric.values, [1.0, 9.0, 40.0, 25.0])
+
+    valid = np.isfinite(transformed.values)
+    expected_average = np.sum(
+        transformed.values[valid] * effective_volume.values[valid]
+    ) / np.sum(effective_volume.values[valid])
+    np.testing.assert_allclose(tgrid.average(transformed, "Z"), expected_average)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_target_grid_keeps_other_axes_and_metrics():
+    # 2D grid: an X axis with its own metric must survive target_grid
+    xc = np.array([0.0, 1.0, 2.0])
+    dx = xr.DataArray([2.0, 3.0, 4.0], dims=["x"], coords={"x": xc}, name="dx")
+    bounds = np.array([0.0, 10.0, 50.0, 75.0])
+    centers = 0.5 * (bounds[:-1] + bounds[1:])
+    dz = xr.DataArray(
+        np.broadcast_to(np.diff(bounds), (3, 3)).copy(),
+        dims=["x", "z"],
+        coords={"x": xc, "z": centers},
+        name="dz",
+    )
+    # distinct concentrations per column so reductions cannot pass by accident
+    conc = xr.DataArray(
+        np.array([[1.0, 4.0, 2.0], [10.0, 20.0, 30.0], [5.0, 6.0, 7.0]]),
+        dims=["x", "z"],
+        coords={"x": xc, "z": centers},
+        name="conc",
+    )
+    ds = xr.Dataset({"conc": conc, "dx": dx, "dz": dz}).assign_coords(zc=bounds)
+    grid = Grid(
+        ds,
+        coords={"X": {"center": "x"}, "Z": {"center": "z", "outer": "zc"}},
+        metrics={"X": ["dx"], "Z": ["dz"]},
+        autoparse_metadata=False,
+    )
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        np.array([0.0, 10.0, 50.0, 75.0]),
+        method="conservative",
+        quantity="intensive",
+        coverage_threshold=0.0,
+        return_effective_volume=True,
+    )
+    tgrid = target_grid(grid, "Z", transformed, effective_volume)
+    target_dim = [d for d in transformed.dims if d != "x"][0]
+
+    # the transformed axis must point at the new target dimension, while the
+    # horizontal axis still points at `x` (regression for dim-order detection)
+    assert tgrid.axes["Z"].coords["center"] == target_dim
+    assert tgrid.axes["X"].coords["center"] == "x"
+
+    # the horizontal metric is still registered and usable
+    np.testing.assert_allclose(
+        tgrid.get_metric(transformed, "X").values, [2.0, 3.0, 4.0]
+    )
+
+    # vertical integration reduces the target dimension and conserves each
+    # column's conc*thickness content
+    vertical_integral = tgrid.integrate(transformed, "Z")
+    assert target_dim not in vertical_integral.dims
+    np.testing.assert_allclose(
+        vertical_integral.values, (conc * dz).sum("z").values
+    )
+
+    # full 2D content is conserved as well
+    full_integral = tgrid.integrate(transformed, ["X", "Z"])
+    np.testing.assert_allclose(
+        full_integral.values, (conc * dz * dx).sum().values
+    )
+
+    # averaging over X still works with the carried-over metric
+    horizontal_mean = tgrid.average(transformed, "X")
+    assert set(horizontal_mean.dims) == set(transformed.dims) - {"x"}
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_target_grid_rejects_ambiguous_target_dimension():
+    # if the array handed to target_grid has no dimension that can be
+    # uniquely attributed to the transformed axis, raise rather than guess
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    transformed, effective_volume = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+        return_effective_volume=True,
+    )
+    # pretend the transformed axis is an unknown name so every output
+    # dimension is treated as belonging to "other" axes -> no candidate
+    with pytest.raises(ValueError, match="transformed coordinate"):
+        target_grid(grid, "NONEXISTENT_AXIS", transformed, effective_volume)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_mode_validation_errors():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+
+    with pytest.raises(ValueError, match="quantity"):
+        grid.transform(
+            conc, "Z", _INTENSIVE_TARGET,
+            method="conservative", quantity="nonsense",
+        )
+
+    with pytest.raises(ValueError, match="intensive"):
+        grid.transform(
+            conc, "Z", _INTENSIVE_TARGET,
+            method="linear", quantity="intensive",
+        )
+
+    with pytest.raises(ValueError, match="coverage_threshold"):
+        grid.transform(
+            conc, "Z", _INTENSIVE_TARGET,
+            method="conservative", quantity="intensive",
+            coverage_threshold=1.5,
+        )
+
+    with pytest.raises(ValueError, match="return_effective_volume"):
+        grid.transform(
+            conc, "Z", _INTENSIVE_TARGET,
+            method="linear", return_effective_volume=True,
+        )
+
+    # a grid without a registered volume metric cannot run the intensive mode
+    bare_grid, _, bare_conc, _ = _make_volume_grid(
+        [1.0, 4.0, 2.0], [10.0, 40.0, 25.0], register_metric=False
+    )
+    with pytest.raises(KeyError, match="effective volume metric"):
+        bare_grid.transform(
+            bare_conc, "Z", _INTENSIVE_TARGET,
+            method="conservative", quantity="intensive",
+        )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_extensive_mode_unchanged_with_new_defaults():
+    # the new keyword defaults must leave the extensive path bit-for-bit
+    # identical to the previous behavior
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    total_amount = conc * volume
+    extensive = grid.transform(
+        total_amount, "Z", _INTENSIVE_TARGET, method="conservative"
+    )
+    np.testing.assert_allclose(extensive.values, [1.0, 9.0, 160.0, 50.0])
+    # conservation of the extensive total
+    np.testing.assert_allclose(
+        extensive.sum().values, total_amount.sum().values
+    )
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_conservative_multidim_broadcast():
+    # broadcast the 1D column over an extra dimension and check the 1D result
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    na = 4
+    conc_b = conc.expand_dims(a=na).copy(deep=True)
+    transformed = grid.transform(
+        conc_b,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+    )
+    single = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+    )
+    # the transformed target dimension comes first; align before comparing
+    _, expected = xr.broadcast(transformed, single)
+    xr.testing.assert_allclose(transformed, expected)
+
+
+@pytest.mark.skipif(numba is None, reason="numba required")
+def test_intensive_conservative_dask():
+    grid, ds, conc, volume = _make_volume_grid([1.0, 4.0, 2.0], [10.0, 40.0, 25.0])
+    na = 4
+    conc_b = conc.expand_dims(a=na).chunk({"a": 2}).copy(deep=True)
+    transformed = grid.transform(
+        conc_b,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+    ).load()
+    single = grid.transform(
+        conc,
+        "Z",
+        _INTENSIVE_TARGET,
+        method="conservative",
+        quantity="intensive",
+    )
+    _, expected = xr.broadcast(transformed, single)
+    xr.testing.assert_allclose(transformed, expected)

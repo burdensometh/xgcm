@@ -191,6 +191,117 @@ def interp_1d_conservative(phi, theta, target_theta_bins):
     return out
 
 
+@guvectorize(
+    [
+        (float64[:], float64[:], float64[:], float64[:], float64[:]),
+        (float32[:], float32[:], float32[:], float32[:], float32[:]),
+    ],
+    "(n),(n),(m),(m)->(m)",
+    nopython=True,
+)
+def _coverage_1d_conservative(theta_1, theta_2, theta_hat_1, theta_hat_2, output):
+    # Fractional coverage of every target bin by the source cells, measured in
+    # units of the target-coordinate (theta) extent of the bin. The same overlap
+    # geometry as in `_interp_1d_conservative` is used, so that the coverage
+    # describes exactly how much of each target bin received contributions.
+    output[:] = np.nan
+
+    n = len(theta_1)
+    m = len(theta_hat_1)
+
+    for j in range(m):
+        width = theta_hat_2[j] - theta_hat_1[j]
+        if width == 0:
+            # a zero-width target bin has no meaningful coverage fraction
+            output[j] = np.nan
+            continue
+        overlap = 0.0
+        for i in range(n):
+            # mirror the boundary-value handling of _interp_1d_conservative
+            if np.isnan(theta_1[i]) and np.isnan(theta_2[i]):
+                continue
+            elif np.isnan(theta_1[i]):
+                theta_min = theta_max = theta_2[i]
+            elif np.isnan(theta_2[i]):
+                theta_min = theta_max = theta_1[i]
+            elif theta_1[i] < theta_2[i]:
+                theta_min = theta_1[i]
+                theta_max = theta_2[i]
+            else:
+                theta_min = theta_2[i]
+                theta_max = theta_1[i]
+
+            if (theta_hat_1[j] > theta_max) or (theta_hat_2[j] < theta_min):
+                # no overlap between the source cell and the target bin
+                continue
+            elif theta_max == theta_min:
+                # a homogeneous (zero-extent) source surface contributes no
+                # measurable extent to the target bin
+                continue
+            else:
+                theta_hat_min = max(theta_min, theta_hat_1[j])
+                theta_hat_max = min(theta_max, theta_hat_2[j])
+                overlap += theta_hat_max - theta_hat_min
+        output[j] = overlap / width
+
+
+def coverage_1d_conservative(theta, target_theta_bins):
+    """
+    Geometric overlap coverage of target bins by the source cells.
+
+    For each target bin the function returns the sum of the fractions of
+    the bin's extent in the theta coordinate that overlap with source
+    cells. The overlap geometry is identical to the one used by
+    :func:`interp_1d_conservative`, including the boundary handling for
+    missing vertex values and non-monotonic stratification.
+
+    For a monotonic theta coordinate every part of a target bin overlaps
+    at most one source cell, so the result is a true coverage fraction in
+    the closed interval [0, 1]. For a non-monotonic (overturning)
+    coordinate several source layers can map onto the same target bin; the
+    returned value is then an overlap *multiplicity* that can exceed 1,
+    meaning the bin is filled by more than one source layer (it is over-,
+    not under-represented). Clip the result to 1 when a [0, 1] coverage
+    fraction is needed for a threshold.
+
+    Parameters
+    ----------
+    theta : array_like
+        Array of shape (..., n+1) giving values of scalar theta on the
+        source cell vertices.
+    target_theta_bins : array_like
+        Array of shape (m) defining the bounds of the target bins.
+
+    Returns
+    -------
+    coverage : array_like
+        Array of shape (..., m-1) of geometric overlap coverage (see
+        above). Target bins without any overlap get zero coverage;
+        zero-width target bins get NaN.
+    """
+
+    assert target_theta_bins.ndim == 1
+
+    target_diff = np.diff(target_theta_bins)
+    if all(target_diff < 0):
+        flip_switch = True
+        target_theta_bins = target_theta_bins[::-1]
+    elif all(target_diff > 0):
+        flip_switch = False
+    else:
+        raise ValueError("Target values are not monotonic")
+
+    theta_1 = theta[..., :-1]
+    theta_2 = theta[..., 1:]
+    theta_hat_1 = target_theta_bins[:-1]
+    theta_hat_2 = target_theta_bins[1:]
+
+    out = _coverage_1d_conservative(theta_1, theta_2, theta_hat_1, theta_hat_2)
+    if flip_switch:
+        out = out[::-1]
+    return out
+
+
 """Mid level functions (xarray)"""
 
 
@@ -276,6 +387,31 @@ def conservative_interpolation(
     return out
 
 
+@input_handling
+def conservative_coverage(
+    phi, theta, target_theta_levels, phi_dim, theta_dim, target_dim, **kwargs
+):
+    # `phi` is only passed through the naming decorator; the coverage itself
+    # only depends on the coordinate geometry (theta and target levels).
+    out = xr.apply_ufunc(
+        coverage_1d_conservative,
+        theta,
+        target_theta_levels,
+        kwargs=kwargs,
+        input_core_dims=[[theta_dim], [target_dim]],
+        output_core_dims=[["remapped"]],
+        dask="parallelized",
+        dask_gufunc_kwargs={"output_sizes": {"remapped": len(target_theta_levels) - 1}},
+        output_dtypes=[theta.dtype],
+    ).rename({"remapped": target_dim})
+
+    # assign the target cell center
+    target_centers = (target_theta_levels.data[1:] + target_theta_levels.data[:-1]) / 2
+    out = out.assign_coords({target_dim: target_centers})
+
+    return out
+
+
 def transform(
     grid,
     axis_name,
@@ -287,6 +423,9 @@ def transform(
     mask_edges=True,
     bypass_checks=False,
     suffix="_transformed",
+    quantity="extensive",
+    coverage_threshold=1.0,
+    return_effective_volume=False,
 ):
     """Convert an array of data to new 1D-coordinates.
     The method takes a multidimensional array of data `da` and
@@ -317,14 +456,30 @@ def transform(
       to the target and target data values prior to linear interpolation.
     - 'conservative': Values are transformed while conserving the
       integral of `da` along each 1D column. This method can be used
-      with non-monotonic values of `target_data`. Currently this will
-      only work with extensive quantities (like heat, mass, transport)
-      but not with intensive quantities (like temperature, density,
-      velocity). N given `target` values are interpreted as cell-bounds
-      and the returned array will have N-1 elements along the newly
-      created coordinate, with coordinate values that are interpolated
-      between `target` values. This method does currently not work
-      for multi-dimensional targets.
+      with non-monotonic values of `target_data`. N given `target`
+      values are interpreted as cell-bounds and the returned array
+      will have N-1 elements along the newly created coordinate, with
+      coordinate values that are interpolated between `target` values.
+      This method does currently not work for multi-dimensional targets.
+      The interpretation of `da` is controlled by `quantity`:
+
+      * ``quantity='extensive'`` (the default): `da` is an extensive
+        quantity (like heat, mass, transport) that is already weighted
+        by the source cell volume along the transform axis and is simply
+        accumulated into the target bins. Intensive quantities (like
+        temperature, density, velocity) cannot be remapped this way.
+      * ``quantity='intensive'``: `da` is an intensive quantity (a
+        concentration). It is first multiplied with the source effective
+        volume (the grid metric along `axis_name`) to form an extensive
+        total amount; both the total amount and the effective volume are
+        remapped conservatively and independently, and the target
+        concentration is their ratio. Target bins whose coverage by the
+        source grid is below `coverage_threshold` are set to NaN; in
+        particular a bin with zero coverage is never assigned a zero
+        concentration. The remapped effective volume can be returned and
+        registered as a metric on a target `Grid` (see
+        :func:`target_grid`) so that subsequent `average` / `integrate`
+        calls use the same partial-coverage accounting as the remap.
     Parameters
     ----------
     grid : xgcm.Grid
@@ -361,11 +516,42 @@ def transform(
     suffix : str, optional
         Customizable suffix to the name of the output array. This will
         be added to the original name of `da`. Defaults to `_transformed`.
+    quantity : {'extensive', 'intensive'}, optional
+        Only applies to `method='conservative'`. Selects whether `da` is
+        treated as an extensive quantity (the default, preserves the
+        original behavior) or as an intensive concentration. The
+        intensive mode requires a grid metric (cell volume along
+        `axis_name`) to be registered on `grid`.
+    coverage_threshold : float, optional
+        Only applies to `method='conservative'` with
+        ``quantity='intensive'``. Minimum source coverage fraction (a
+        number between 0 and 1) of a target bin for a concentration to be
+        returned. The coverage fraction is the geometric overlap between
+        source cells and the target bin, clipped to 1 (clipping only
+        matters for a non-monotonic / overturning coordinate, where several
+        source layers can fill one target bin). Bins with coverage below
+        the threshold are set to NaN. The default of 1.0 means that only
+        fully covered target bins receive a value; bins with zero
+        coverage are always NaN regardless of this setting.
+    return_effective_volume : bool, optional
+        Only applies to `method='conservative'` with
+        ``quantity='intensive'``. If True, return a tuple
+        ``(concentration, effective_volume)`` where the second element is
+        the conservatively remapped source effective volume on the
+        target bins. The volume is finite everywhere, with zero effective
+        volume on target bins that receive no source contribution; the
+        concentration's own NaN mask (controlled by
+        `coverage_threshold`) carries the missingness. The volume can be
+        registered as a metric on the target `Grid` (see
+        :func:`target_grid`), ensuring that later `average` /
+        `integrate` operations use exactly the coverage convention of
+        the remap. Defaults to False.
 
     Returns
     -------
-    xr.DataArray
-        The transformed data
+    xr.DataArray or tuple of xr.DataArray
+        The transformed data. When `return_effective_volume` is True, a
+        tuple ``(concentration, effective_volume)`` is returned.
 
     Notes
     -----
@@ -395,6 +581,35 @@ def transform(
             raise ValueError(
                 f"`{var_name}` needs to be a {' or '.join([str(a) for a in allowed_types])}. Found {type(variable)}"
             )
+
+    # validate the intensive / extensive mode selection
+    if quantity not in ("extensive", "intensive"):
+        raise ValueError(
+            f"`quantity` must be either 'extensive' or 'intensive', got {quantity!r}."
+        )
+    if quantity == "intensive" and method != "conservative":
+        raise ValueError(
+            "The intensive quantity mode (`quantity='intensive'`) is only "
+            "available with `method='conservative'`, since a concentration "
+            "cannot be remapped conservatively without the target cell bounds."
+        )
+    if return_effective_volume and not (
+        method == "conservative" and quantity == "intensive"
+    ):
+        raise ValueError(
+            "`return_effective_volume=True` is only supported with "
+            "`method='conservative'` and `quantity='intensive'`."
+        )
+    if not (0.0 <= coverage_threshold <= 1.0):
+        raise ValueError(
+            "`coverage_threshold` must be a fraction between 0 and 1, "
+            f"got {coverage_threshold}."
+        )
+    if method != "conservative" and coverage_threshold != 1.0:
+        warnings.warn(
+            "`coverage_threshold` only applies to conservative transformations "
+            "of intensive quantities and will be ignored."
+        )
 
     def _target_data_name_handling(target_data):
         """Handle target_data input without a name"""
@@ -502,6 +717,23 @@ def transform(
                 {axis._get_position_name(target_data)[1]: -1}
             )
 
+        if quantity == "intensive":
+            # the concentration is never remapped directly: form the total
+            # amount and remap it together with the effective volume
+            return _conservative_intensive(
+                grid=grid,
+                axis_name=axis_name,
+                da=da,
+                dim=dim,
+                target_data=target_data,
+                target_data_dim=target_data_dim,
+                target=target,
+                target_dim=target_dim,
+                coverage_threshold=coverage_threshold,
+                suffix=suffix,
+                return_effective_volume=return_effective_volume,
+            )
+
         out = conservative_interpolation(
             da,
             target_data,
@@ -512,3 +744,255 @@ def transform(
         )
 
     return out
+
+
+def _conservative_intensive(
+    grid,
+    axis_name,
+    da,
+    dim,
+    target_data,
+    target_data_dim,
+    target,
+    target_dim,
+    coverage_threshold,
+    suffix,
+    return_effective_volume,
+):
+    """Conservative remap of an intensive quantity (a concentration).
+
+    The concentration is never remapped directly. It is combined with the
+    source cell volume to form an extensive total amount, and both the total
+    amount and the effective volume are remapped independently with the
+    extensive conservative kernel. The target concentration is the ratio of
+    the two remapped fields. Target bins not covered enough by the source
+    grid are declared missing (NaN); in particular zero coverage can never
+    produce a zero concentration.
+    """
+    # the source effective volume on the cells of `da`: a metric registered
+    # along the transform axis (e.g. cell thickness / area / volume)
+    try:
+        source_volume = grid.get_metric(da, axis_name)
+    except KeyError:
+        raise KeyError(
+            "The intensive quantity mode requires an effective volume metric "
+            f"along axis {axis_name!r} to be registered on the source grid "
+            "(e.g. a cell thickness or volume metric, see `Grid.set_metrics`)."
+        )
+
+    # align the metric to `da`, including its missing-value mask. The same
+    # mask is applied to amount and volume so that both remaps use exactly
+    # the same contributing source cells.
+    mask = np.isfinite(da)
+    source_volume = xr.broadcast(source_volume, da)[0].where(mask)
+
+    # 1. form the extensive total amount in each source cell
+    total_amount = da * source_volume
+
+    # 2. remap total amount and effective volume independently, using the
+    #    unmodified extensive (conservative) kernel
+    remapped_amount = conservative_interpolation(
+        total_amount,
+        target_data,
+        target,
+        dim,
+        target_data_dim,
+        target_dim,
+    )
+    effective_volume = conservative_interpolation(
+        source_volume,
+        target_data,
+        target,
+        dim,
+        target_data_dim,
+        target_dim,
+    )
+
+    # 3. geometric overlap coverage of each target bin by source cells,
+    #    using the identical overlap geometry as the conservative kernel
+    coverage = conservative_coverage(
+        da,
+        target_data,
+        target,
+        dim,
+        target_data_dim,
+        target_dim,
+    )
+
+    # The raw coverage is an overlap multiplicity that can exceed 1 for an
+    # overturning (non-monotonic) coordinate, where several source layers map
+    # onto one target bin. For a coverage threshold we need a [0, 1]
+    # fraction: a bin whose whole extent is covered (multiplicity >= 1) is
+    # fully represented and must pass every threshold, so clip at 1.
+    coverage_fraction = np.minimum(coverage, 1.0)
+
+    # A target bin is declared missing when its coverage is below the
+    # declared threshold. Zero coverage is therefore always missing (it also
+    # has zero remapped effective volume), so a zero concentration can never
+    # be emitted for an uncovered bin.
+    insufficient = np.isnan(coverage_fraction) | (
+        coverage_fraction < coverage_threshold
+    )
+
+    # avoid division-by-zero warnings: bins without any remapped volume are
+    # masked before the ratio is taken
+    valid = (~insufficient) & (effective_volume > 0)
+    concentration = xr.where(
+        valid, remapped_amount / effective_volume.where(valid), np.nan
+    )
+
+    # naming: inherit the input name and apply the user suffix
+    if da.name:
+        concentration.name = da.name + suffix
+        effective_volume.name = f"{da.name}_effective_volume{suffix}"
+    else:
+        effective_volume.name = f"effective_volume{suffix}"
+
+    # The effective volume is a physical remapped field: a target bin without
+    # any contributing source cell genuinely has *zero* effective volume (the
+    # conservative kernel leaves such bins as NaN). Fill those with zero so
+    # the returned volume is finite everywhere and can be registered directly
+    # as a grid metric -- xarray's weighted reductions reject NaN weights, and
+    # a zero weight makes `average`/`integrate` skip exactly these bins. The
+    # missingness of the concentration itself is carried by its own NaN mask
+    # (driven by `coverage_threshold`), not by the volume.
+    effective_volume = effective_volume.fillna(0.0)
+
+    if return_effective_volume:
+        return concentration, effective_volume
+    return concentration
+
+
+def target_grid(source_grid, axis_name, transformed, effective_volume):
+    """Build a target `xgcm.Grid` with the remapped effective volume registered.
+
+    An intensive conservative remap produces values on a new coordinate whose
+    target bins may only be partially covered by the source grid. The remapped
+    effective volume returned by
+    :func:`transform` (with ``return_effective_volume=True``) encodes exactly
+    that coverage. Registering it as the metric along `axis_name` on the
+    target grid ensures that subsequent `Grid.average` and `Grid.integrate`
+    calls weight with the same effective volume that was used to compute the
+    remapped concentration, instead of silently assuming full coverage.
+
+    Parameters
+    ----------
+    source_grid : xgcm.Grid
+        The grid object used for the transformation. Its axes (other than the
+        transformed `axis_name`), coordinates and metrics are carried over.
+    axis_name : str
+        Name of the axis along which the transformation was performed.
+    transformed : xr.DataArray
+        The concentration returned by :func:`transform`. Only its dimensions
+        and the name of the transformed coordinate are used.
+    effective_volume : xr.DataArray
+        The effective volume returned together with `transformed`. It is
+        registered as the metric for `axis_name` on the target grid.
+
+    Returns
+    -------
+    xgcm.Grid
+        A new grid whose transformed axis has its center at the new target
+        coordinate and whose metric along `axis_name` is `effective_volume`.
+
+    Examples
+    --------
+    >>> conc, veff = grid.transform(
+    ...     da, "Z", target, method="conservative", quantity="intensive",
+    ...     return_effective_volume=True,
+    ... )
+    >>> tgrid = target_grid(grid, "Z", conc, veff)
+    >>> tgrid.average(conc, "Z")  # weighted with the remapped coverage
+    """
+    # local import to avoid a circular import at module load time
+    from .grid import Grid
+
+    # The transformed dimension is the new coordinate introduced by the
+    # remap. For a multi-dimensional field the transform axis can end up at
+    # any position (it is typically the first core dimension), so it cannot
+    # be picked by index. Identify it as the output dimension not belonging
+    # to any of the *other* (non-transformed) source axes.
+    other_axis_dims = set()
+    for other_name, other_ax in source_grid.axes.items():
+        if other_name != axis_name:
+            other_axis_dims.update(other_ax.coords.values())
+    target_candidates = [d for d in transformed.dims if d not in other_axis_dims]
+    if len(target_candidates) != 1:
+        raise ValueError(
+            "Could not uniquely determine the transformed coordinate from "
+            f"{transformed.dims!r} (candidates: {target_candidates!r}). "
+            "`transformed` must be the concentration returned by "
+            "`Grid.transform` along `axis_name`."
+        )
+    target_dim = target_candidates[0]
+
+    # carry over the axis/coordinate specification, replacing the transformed
+    # axis with a center-only definition on the new target coordinate
+    coords = {}
+    for ax_name, ax in source_grid.axes.items():
+        if ax_name == axis_name:
+            coords[ax_name] = {"center": target_dim}
+        else:
+            coords[ax_name] = dict(ax.coords)
+
+    # The transformed coordinate can reuse the *name* of a source outer/index
+    # coordinate (e.g. "zc") while carrying different values (target cell
+    # centers rather than source bounds). Building the target dataset must
+    # therefore avoid index alignment against the source dataset: reset the
+    # transformed coordinate to a plain dimension and re-attach the target
+    # cell centers explicitly.
+    target_centers = transformed.coords[target_dim]
+    transformed = transformed.reset_coords(drop=True)
+    effective_volume = effective_volume.reset_coords(drop=True)
+
+    # a metric variable has to live in the grid's dataset. The effective
+    # volume is finite everywhere (zero on a target bin that receives no
+    # source contribution); `fillna` is a defensive guard so a registered
+    # metric can never carry NaN weights, which xarray's weighted reductions
+    # would reject. A zero weight makes `average`/`integrate` skip exactly
+    # the bins with no contributing volume, while the concentration's own
+    # NaN mask handles bins rejected by `coverage_threshold`.
+    volume_name = effective_volume.name or "effective_volume"
+    effective_volume = effective_volume.rename(volume_name).fillna(0.0)
+
+    # start from the source dataset but drop any coordinate sharing the
+    # target dimension's name (it would otherwise misalign the assignment)
+    source_ds = source_grid._ds
+    if target_dim in source_ds.coords:
+        source_ds = source_ds.reset_index(target_dim, drop=True)
+    ds = source_ds.assign(
+        {
+            transformed.name
+            or "transformed": transformed,
+            volume_name: effective_volume,
+        }
+    ).assign_coords({target_dim: target_centers})
+
+    # carry over existing metrics (by variable name) and register the
+    # effective volume for the transformed axis, overwriting any inherited
+    # metric for that axis combination
+    metrics = {
+        tuple(axes): [mv.name for mv in metric_vars]
+        for axes, metric_vars in source_grid._metrics.items()
+    }
+    metric_axes = tuple([axis_name])
+    existing = metrics.get(metric_axes, [])
+    if volume_name in existing:
+        existing = [name for name in existing if name != volume_name]
+    metrics[metric_axes] = existing + [volume_name]
+
+    padding = {ax_name: ax.padding for ax_name, ax in source_grid.axes.items()}
+    padding = {k: v for k, v in padding.items() if v is not None}
+
+    target = Grid(
+        ds,
+        coords=coords,
+        metrics=metrics,
+        padding=padding if padding else None,
+        autoparse_metadata=False,
+    )
+    # `ds.assign` may keep a same-named variable carried over from the source
+    # dataset; overwrite the inherited registration so the zero-filled
+    # effective volume (not a stale NaN-bearing one) is the target metric.
+    target.set_metrics(metric_axes, [volume_name], overwrite=True)
+    return target
